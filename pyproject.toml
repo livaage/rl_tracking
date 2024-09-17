@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "rl_tracking"
+version = "0.1.0"
+description = ""
+authors = ["liv <liv.helen.vage@cern.ch>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+scikit-learn = "^1.5.2"
+torch = "^2.4.1"
+lightning = "^2.4.0"
+pandas = "^2.2.2"
+trackml = {git = "https://github.com/LAL/trackml-library"}
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
