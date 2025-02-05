@@ -16,10 +16,11 @@ class RLKernelIterableDataset(IterableDataset):
 
     def _read_file(self, event_number):
         # Efficiently read a file in chunks if needed
-        sample, label = self.event_processor.process(event_number)
-        for i in range(len(sample)):
-            yield sample[i], label[i]
-            self.sample_count += 1
+        sample = self.event_processor.process(event_number)
+        yield sample
+        # for i in range(len(sample)):
+        #     yield sample[i]
+        #     self.sample_count += 1
 
     def __iter__(self):
         self.sample_count = 0
@@ -29,7 +30,7 @@ class RLKernelIterableDataset(IterableDataset):
                 return
 
 class TrackingDataModule(LightningDataModule):
-    def __init__(self, file_paths: list[str] |Path, batch_size: int, event_processor=None, num_workers: int = 1, val_split:float = 0.2):
+    def __init__(self, file_paths: list[str] |Path, batch_size: int, event_processor=None, num_workers: int = 0, val_split:float = 0.2):
         super().__init__()
         self.file_paths = file_paths
         self.batch_size = batch_size

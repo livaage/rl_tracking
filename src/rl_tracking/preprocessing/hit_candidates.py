@@ -66,6 +66,9 @@ class EventProcessor:
         self.hits = hits_wo_last
         self.hits['label'] = positions_in_sorted[:,1]
 
+    def _get_pixel_tracks(self):
+        pass
+
     def process(self, event_dir:str|Path) -> [np.array, np.array]:
         filename = str(event_dir)
         try:
@@ -82,16 +85,18 @@ class EventProcessor:
         self.hits = hits.merge(particles, on='particle_id')
         self.hits['r'] = np.sqrt(self.hits['x'] ** 2 + self.hits['y'] ** 2)
         self.hits["pt"] = np.sqrt(self.hits.px ** 2 + self.hits.py ** 2)
-        self.hits = self.hits[self.hits['pt'] > 2]
         self.hits = self.hits.sort_values(['r', 'z'])
 
-        self._get_prev_hit()
-        self._get_prev_prev_hit()
-        self._get_next_hit()
-        self._get_comp_hits()
-        self.hits = self.hits.dropna()
-        self.hits.to_csv('test.csv')
-        selected_cols = [x for x in self.hits.columns if x in self.features or x.startswith('comp_')]
-
-        return self.hits[selected_cols].to_numpy(), self.hits['label'].values
-
+        # self._get_prev_hit()
+        # self._get_prev_prev_hit()
+        # self._get_next_hit()
+        # self._get_comp_hits()
+        # self.hits = self.hits[self.hits['pt'] > 2]
+        # self.hits = self.hits[~self.hits['volume_id'].isin([7,8,9])]
+        # self.hits = self.hits.dropna()
+        # self.hits.to_csv('test.csv')
+        # selected_cols = [x for x in self.hits.columns if x in self.features or x.startswith('comp_')
+        #                  or x in ['pt', 'px', 'py', 'pz']]
+        # return self.hits[selected_cols].to_numpy(), self.hits['label'].values
+        print(self.hits.columns)
+        return self.hits.to_numpy()

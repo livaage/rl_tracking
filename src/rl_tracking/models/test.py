@@ -7,7 +7,7 @@ from torchmetrics.classification import Accuracy
 class SimpleNN(pl.LightningModule):
     def __init__(self):
         super(SimpleNN, self).__init__()
-        self.fc1 = nn.Linear(10, 128)  # Input layer to hidden layer
+        self.fc1 = nn.Linear(14, 128)  # Input layer to hidden layer
         self.fc2 = nn.Linear(128, 256)
         self.fc3 = nn.Linear(256, 128)# Hidden layer to output layer
         self.fc4 = nn.Linear(128, 3)

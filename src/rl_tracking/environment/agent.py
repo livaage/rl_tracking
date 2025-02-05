@@ -1,10 +1,10 @@
 from collections import namedtuple
-from replay.buffer import ReplayBuffer
+from rl_tracking.replay.buffer import ReplayBuffer
 from torch import nn
 import torch
 import numpy as np
 from typing import Tuple
-
+from rl_tracking.environment.tracking_env import TrackingEnv
 Experience = namedtuple('Transition',
                         ['state', 'action', 'next_state', 'reward', 'done'])
 
@@ -12,7 +12,7 @@ Experience = namedtuple('Transition',
 class Agent:
     """Base Agent class handeling the interaction with the environment."""
 
-    def __init__(self, env: gym.Env, replay_buffer: ReplayBuffer) -> None:
+    def __init__(self, env: TrackingEnv , replay_buffer: ReplayBuffer) -> None:
         """
         Args:
             env: training environment
