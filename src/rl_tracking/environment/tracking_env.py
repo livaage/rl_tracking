@@ -5,7 +5,8 @@ from rl_tracking.physics.track import Helix
 
 COLS = ['hit_id', 'x', 'y', 'z', 'volume_id', 'layer_id', 'module_id',
        'particle_id', 'tx', 'ty', 'tz', 'tpx', 'tpy', 'tpz', 'weight', 'vx',
-       'vy', 'vz', 'px', 'py', 'pz', 'q', 'nhits', 'r', 'pt']
+       'vy', 'vz', 'px', 'py', 'pz', 'q', 'nhits', 'r', 'pt',
+        'unique_layer_id', 'phi', 'theta']
 
 
 class TrackingEnv:
@@ -13,7 +14,7 @@ class TrackingEnv:
         """Initialize the environment with a data loader and a column for step count."""
         self.data_loader = iter(data_loader)  # Streaming file list
         self.current_data = None  # Stores the data from the current file
-        self.unique_values = []  # Tracks remaining unique values for steps
+        self.pids_to_explore = []  # Tracks remaining unique values for steps
         self.particle_index = 0  # Tracks current step within the file
         self.load_next_file()  # Load the first file
         self.observation_space = Box(low=0, high=120, shape=(3, 4), dtype=np.float32)
@@ -35,42 +36,46 @@ class TrackingEnv:
                 self.current_data.view(self.current_data.shape[1], self.current_data.shape[2])
                 , columns = COLS)
             self._perform_particle_selections()
-            self.accepted_particle_ids = np.random.shuffle(self.current_data['particle_id'].unique())
+            self.pids_to_explore = self.current_data['particle_id'].unique()
+            np.random.shuffle(self.pids_to_explore)
+            print(self.pids_to_explore)
             self.particle_index = 0  # Reset index
         except StopIteration:
-            self.current_data, self.unique_values = None, []  # End of stream
+            self.current_data, self.pids_to_explore = None, []  # End of stream
 
     def reset(self):
         """Reset environment to the start of the current file."""
-        if not self.unique_values:  # If the file is exhausted, load a new one
+        if len(self.pids_to_explore) == 0:  # If the file is exhausted, load a new one
             self.load_next_file()
             self.particle_index = 0
         if self.current_data is None:
             return None  # No more data
 
-        if self.hit_number > len(self.current_track):
-            self.get_new_track()
-            self.hit_number = 0
-        return self.get_current_state()
+        #if self.hit_number > len(self.current_track):
+        self.get_new_track()
+        self.hit_number = 0
+        return self.get_current_state(), []
 
     def get_new_track(self):
         self.current_track = self.current_data[
-            self.current_data['particle_id'] == self.accepted_particle_ids[self.particle_index]]
+            self.current_data['particle_id'] == self.pids_to_explore[self.particle_index]]
+        np.delete(self.pids_to_explore, self.particle_index)
         self.particle_index += 1
         self.helix = Helix(self.current_track)
+        print(self.helix.x, self.helix.y, self.helix.z)
 
     def get_current_state(self):
         """Return the current step’s data."""
-        if self.particle_index < len(self.unique_values):
-            self.current_track = self.current_data[self.current_data['particle_id'] == self.accepted_particle_ids[self.particle_index]]
-
+        current_pos = self.current_track.iloc[self.hit_number][['z', 'r']]
+        comp_hits, rewards, done, correct_in_comp, correct_is_best = (
+            self.helix.propagate_one_layer(self.current_data))
+        print(comp_hits)
         return None
 
     def step(self, action):
         """Take an action and move to the next unique value in the column."""
 
-        comp_hits, rewards, done, correct_in_comp, correct_is_best = (
-            self.helix.propagate_one_layer(self.current_data))
+
         self.hit_number +=1
         self.particle_index += 1
         if self.particle_index >= len(self.unique_values):  # If all steps are done, load a new file

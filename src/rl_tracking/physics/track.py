@@ -5,9 +5,9 @@ from rl_tracking.physics import propagate
 from rl_tracking.physics import comp_hits_shaper
 import json
 
-path_plans = pd.read_pickle('physics/theta_path_plan.pkl')
+path_plans = pd.read_pickle('/Users/liv/rl_tracking/src/rl_tracking/physics/theta_path_plan.pkl')
 
-new_path_plans = open("physics//momentum_theta_path_plan_100.json")
+new_path_plans = open("/Users/liv/rl_tracking/src/rl_tracking/physics/momentum_theta_path_plan_100.json")
 new_path_plans = json.load(new_path_plans)
 
 
@@ -30,7 +30,7 @@ class Helix:
    self.x, self.y, self.z, self.current_layer = p.iloc[ix_final_seed_hit][['x', 'y', 'z', 'unique_layer_id']].values
    self.r0 = np.sqrt(self.x**2+self.y**2)
    self.path_plan = get_sub_value(new_path_plans, self.pt, self.theta)
-
+   print(self.path_plan)
 
   def propagate_one_layer(self, hit_holder):
     correct_in_comp = 0
@@ -101,12 +101,12 @@ def get_sub_value(new_path_plans, pt, theta):
   if pt_key in new_path_plans:
     pt_sub = pt_key
   else:
-    pt_sub = get_closest_value(new_path_plans.keys(), pt)
+    pt_sub = str(get_closest_value(new_path_plans.keys(), pt))
 
   if theta_key in new_path_plans[pt_sub]:
     theta_sub = theta_key
   else:
-    theta_sub = get_closest_value(new_path_plans[pt_sub].keys(), theta)
+    theta_sub = str(get_closest_value(new_path_plans[pt_sub].keys(), theta))
 
   # Return the path plan for the closest pt_sub and theta_sub
   return np.array(new_path_plans[pt_sub][theta_sub])

@@ -26,7 +26,7 @@ class Agent:
     def reset(self) -> None:
         """Resents the environment and updates the state."""
         self.state, info = self.env.reset()
-
+        print(self.state)
     def get_action(self, net: nn.Module, epsilon: float, device: str) -> int:
         """Using the given network, decide what action to carry out using an epsilon-greedy policy.
 

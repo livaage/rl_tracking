@@ -12,6 +12,7 @@ import torch
 
 DEFAULT_FEATURES = ["r", "z", "prev_z", "prev_r"]
 DEFAULT_NUM_COMPATIBLE_HITS = 3
+LAYER_REMAPPING = pd.read_csv('tml_layer_remap.csv')
 
 @dataclass
 class EventProcessor:
@@ -69,6 +70,13 @@ class EventProcessor:
     def _get_pixel_tracks(self):
         pass
 
+    def _add_cols(self):
+        self.hits = self.hits.merge(LAYER_REMAPPING.drop(['Unnamed: 0'], axis=1),
+                                                               on=['volume_id', 'layer_id'], how = 'left')
+        print(self.hits)
+        self.hits['theta'] = np.arctan2(self.hits.r, self.hits.z)
+        self.hits['phi'] = np.arctan2(self.hits.y, self.hits.x)
+
     def process(self, event_dir:str|Path) -> [np.array, np.array]:
         filename = str(event_dir)
         try:
@@ -86,6 +94,7 @@ class EventProcessor:
         self.hits['r'] = np.sqrt(self.hits['x'] ** 2 + self.hits['y'] ** 2)
         self.hits["pt"] = np.sqrt(self.hits.px ** 2 + self.hits.py ** 2)
         self.hits = self.hits.sort_values(['r', 'z'])
+        self._add_cols()
 
         # self._get_prev_hit()
         # self._get_prev_prev_hit()
@@ -98,5 +107,7 @@ class EventProcessor:
         # selected_cols = [x for x in self.hits.columns if x in self.features or x.startswith('comp_')
         #                  or x in ['pt', 'px', 'py', 'pz']]
         # return self.hits[selected_cols].to_numpy(), self.hits['label'].values
-        print(self.hits.columns)
         return self.hits.to_numpy()
+
+
+
