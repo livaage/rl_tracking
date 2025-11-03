@@ -4,11 +4,17 @@ import pandas as pd
 from rl_tracking.physics import propagate
 from rl_tracking.physics import comp_hits_shaper
 import json
+from pathlib import Path
+from rl_tracking.utils.logger import get_logger
 
-path_plans = pd.read_pickle('/Users/liv/rl_tracking/src/rl_tracking/physics/theta_path_plan.pkl')
+logger = get_logger()
 
-new_path_plans = open("/Users/liv/rl_tracking/src/rl_tracking/physics/momentum_theta_path_plan_100.json")
-new_path_plans = json.load(new_path_plans)
+# Load data files relative to this module
+PHYSICS_DIR = Path(__file__).parent
+path_plans = pd.read_pickle(PHYSICS_DIR / 'theta_path_plan.pkl')
+
+with open(PHYSICS_DIR / 'momentum_theta_path_plan_100.json') as f:
+    new_path_plans = json.load(f)
 
 
 
@@ -30,9 +36,42 @@ class Helix:
    self.x, self.y, self.z, self.current_layer = p.iloc[ix_final_seed_hit][['x', 'y', 'z', 'unique_layer_id']].values
    self.r0 = np.sqrt(self.x**2+self.y**2)
    self.path_plan = get_sub_value(new_path_plans, self.pt, self.theta)
-   print(self.path_plan)
+   # Initialize correct hit IDs from the particle data
+   self.correct_hit_ids = set(p['hit_id'].values) if 'hit_id' in p.columns else set()
+   # Store the full particle DataFrame for distance calculations
+   self.particle_df = p
+   logger.debug(f"Path plan (unique_layer_ids): {self.path_plan}")
+   logger.debug(f"Current layer (unique_layer_id): {self.current_layer}")
+  
+  def print_helix(self):
+    """Print debug information about the helix state."""
+    return f"x={self.x:.3f}, y={self.y:.3f}, z={self.z:.3f}, r0={self.r0:.3f}, layer={self.current_layer}"
+  
+  def get_correct_hitids_in_layer(self, layer):
+    """Get correct hit IDs for a specific layer."""
+    if 'unique_layer_id' in self.p.columns:
+      layer_hits = self.p[self.p['unique_layer_id'] == layer]
+      if len(layer_hits) > 0 and 'hit_id' in layer_hits.columns:
+        return [int(hit_id) for hit_id in layer_hits['hit_id'].values]
+    return []
+  
+  def get_correct_hits_df_in_layer(self, layer):
+    """Get DataFrame of correct hits for a specific layer."""
+    if 'unique_layer_id' in self.p.columns:
+      layer_hits = self.p[self.p['unique_layer_id'] == layer]
+      if len(layer_hits) > 0:
+        return layer_hits.copy()
+    return pd.DataFrame()
+  
+  def get_closest_hit_to_prop(self, comp_hits):
+    """Get the hit closest to the propagation."""
+    if len(comp_hits) == 0:
+      return None
+    # Simple heuristic: return the first hit for now
+    # You may want to implement actual distance calculation
+    return comp_hits.iloc[0]
 
-  def propagate_one_layer(self, hit_holder):
+  def propagate_one_layer(self, hit_holder, use_distance_reward=False):
     correct_in_comp = 0
     correct_is_best = 0
     done = False
@@ -51,16 +90,17 @@ class Helix:
         break
     else:
       # If no compatible hits are found after 4 attempts, return with an error message
-      print("still no compatible hits")
-      print("helix is ", self.print_helix())
+      logger.warning("still no compatible hits")
+      logger.warning(f"helix is {self.print_helix()}")
       return [], 0, True, 0, 0
 
     self.correct_hit_ids_in_layer = self.get_correct_hitids_in_layer(next_layer)
+    self.correct_hits_df_in_layer = self.get_correct_hits_df_in_layer(next_layer)
     correct_layer = self.p.unique_layer_id.unique()
 
     # If no comp hits found, and current layer is not correct, go to the next layer
     if len(comp_hits) == 0 and self.current_layer not in correct_layer:
-      return self.propagate_one_layer(hit_holder)
+      return self.propagate_one_layer(hit_holder, use_distance_reward)
 
     if len(comp_hits) > 0:
       # Shape the comp hits and find the best match
@@ -71,14 +111,20 @@ class Helix:
         correct_is_best += 1
 
       correct_in_comp = sum(
-        1 for hit_id in comp_hits.hit_id.values() if int(hit_id) in self.correct_hit_ids_in_layer
+        1 for hit_id in comp_hits.hit_id.values if int(hit_id) in self.correct_hit_ids_in_layer
       )
 
-      # Calculate rewards for each hit
-      rewards = [
-        hit_holder.get_reward_binary(comp_hits.iloc[i], self.correct_hit_ids_in_layer)
-        for i in range(len(comp_hits))
-      ]
+      # Calculate rewards for each hit - use distance or binary based on flag
+      if use_distance_reward:
+        rewards = [
+          hit_holder.get_reward_distance(comp_hits.iloc[i], self.correct_hits_df_in_layer, helix_pos=(self.x, self.y, self.z))
+          for i in range(len(comp_hits))
+        ]
+      else:
+        rewards = [
+          hit_holder.get_reward_binary(comp_hits.iloc[i], self.correct_hit_ids_in_layer)
+          for i in range(len(comp_hits))
+        ]
     else:
       comp_hits = []
       rewards = 0
