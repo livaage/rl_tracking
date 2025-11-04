@@ -3,6 +3,7 @@ from pathlib import Path
 import argparse
 import shutil
 import secrets
+import re
 from datetime import datetime
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning import Trainer
@@ -77,7 +78,16 @@ def main(config_path: str | Path):
     # Extract wandb configuration (needed for checkpoint directory name)
     wandb_config = config.get('wandb', {})
     wandb_project = wandb_config.get('project', 'RLTracking')
-    base_name = wandb_config.get('name', 'ptcut2_initial_run')
+    base_name = wandb_config.get('name', 'initial_run')
+    
+    # Incorporate pt cut into run name if it exists
+    # Remove any existing ptcut prefix first, then add the current one
+    pt_cut = particle_filters.get('pt', None)
+    if pt_cut is not None:
+        # Remove existing ptcut prefix if present (e.g., "ptcut1_initial_run" -> "initial_run")
+        base_name = re.sub(r'^ptcut\d+\.?\d*_', '', base_name)
+        # Add current pt cut prefix
+        base_name = f"ptcut{pt_cut}_{base_name}"
     
     # Generate unique run name by appending random string and timestamp
     # This ensures each run gets a unique directory even with the same config

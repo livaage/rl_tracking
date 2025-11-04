@@ -5,6 +5,7 @@ import time
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import mplhep as hep
 from torch.utils.data import DataLoader
 
 from rl_tracking.lightning_modules.dqn import DQNLightning
@@ -125,17 +126,39 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         checkpoint = torch.load(model_path, map_location='cpu')
         if 'hyper_parameters' in checkpoint:
             checkpoint_hparams = checkpoint['hyper_parameters']
+            print(f"\n{'='*60}")
             print(f"Found hyperparameters in checkpoint:")
-            print(f"  particle_filters: {checkpoint_hparams.get('particle_filters', 'N/A')}")
+            print(f"{'='*60}")
+            checkpoint_pf = checkpoint_hparams.get('particle_filters', 'N/A')
+            print(f"  particle_filters: {checkpoint_pf}")
+            if isinstance(checkpoint_pf, dict):
+                print(f"    -> pt: {checkpoint_pf.get('pt', 'NOT SET')}")
+                print(f"    -> nhits_min: {checkpoint_pf.get('nhits_min', 'NOT SET')}")
+                print(f"    -> nhits_max: {checkpoint_pf.get('nhits_max', 'NOT SET')}")
             print(f"  hit_filters: {checkpoint_hparams.get('hit_filters', 'N/A')}")
             print(f"  use_distance_reward: {checkpoint_hparams.get('use_distance_reward', 'N/A')}")
             print(f"  use_truth_path_plan: {checkpoint_hparams.get('use_truth_path_plan', 'N/A')}")
-            print(f"\nUsing hyperparameters from checkpoint (most accurate)\n")
+            print(f"{'='*60}\n")
+            
+            # Compare config file vs checkpoint hyperparameters
+            config_pf = particle_filters
+            checkpoint_pf = checkpoint_hparams.get('particle_filters', {})
+            if isinstance(checkpoint_pf, dict) and isinstance(config_pf, dict):
+                if checkpoint_pf.get('pt') != config_pf.get('pt'):
+                    print(f"⚠️  WARNING: pt filter mismatch!")
+                    print(f"   Config file: pt={config_pf.get('pt', 'NOT SET')}")
+                    print(f"   Checkpoint: pt={checkpoint_pf.get('pt', 'NOT SET')}")
+                    print(f"   Using checkpoint value (this is what the model was trained with)\n")
+            
+            print(f"Using hyperparameters from checkpoint (most accurate - matches training)\n")
             # Use checkpoint hyperparameters if available
             particle_filters = checkpoint_hparams.get('particle_filters', particle_filters)
             hit_filters = checkpoint_hparams.get('hit_filters', hit_filters)
             use_distance_reward = checkpoint_hparams.get('use_distance_reward', use_distance_reward)
             use_truth_path_plan = checkpoint_hparams.get('use_truth_path_plan', use_truth_path_plan)
+        else:
+            print(f"⚠️  No hyperparameters found in checkpoint. Using config file values.")
+            print(f"   This may cause mismatches if config differs from training config!\n")
     except Exception as e:
         print(f"Could not load hyperparameters from checkpoint: {e}")
         print(f"Using config file values instead\n")
@@ -165,10 +188,29 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     print(f"Final Configuration for Evaluation")
     print(f"{'='*60}")
     print(f"Particle filters (used for test): {particle_filters}")
+    print(f"  -> pt filter: {particle_filters.get('pt', 'NOT SET')} (tracks with pt > this value will be included)")
+    print(f"  -> nhits_min: {particle_filters.get('nhits_min', 'NOT SET')}")
+    print(f"  -> nhits_max: {particle_filters.get('nhits_max', 'NOT SET')}")
     print(f"Hit filters (used for test): {hit_filters}")
     print(f"Use distance reward: {use_distance_reward}")
     print(f"Use truth path plan: {use_truth_path_plan}")
     print(f"{'='*60}\n")
+    
+    # Verify that pt filter is set correctly
+    pt_filter = particle_filters.get('pt', None)
+    if pt_filter is None:
+        print(f"⚠️  WARNING: pt filter is not set! All tracks will be included regardless of pt.")
+        print(f"   This may cause evaluation on tracks with pt < 1 if that's not desired.")
+    else:
+        print(f"ℹ️  pt filter is set to {pt_filter}")
+        print(f"   Filter logic: tracks with pt > {pt_filter} will be included")
+        print(f"   Note: Tracks with pt exactly equal to {pt_filter} will be EXCLUDED (strict >)")
+        if pt_filter < 1.0:
+            print(f"⚠️  WARNING: pt filter is set to {pt_filter}, which is < 1.0.")
+            print(f"   This will include tracks with pt > {pt_filter}, including some with pt < 1.0")
+        elif pt_filter == 1.0:
+            print(f"ℹ️  pt filter is exactly 1.0 - tracks with pt > 1.0 will be included")
+            print(f"   Tracks with pt <= 1.0 will be excluded")
     
     # Now setup for test to get test dataset
     dm.setup(stage="test")
@@ -179,19 +221,23 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     model.target_net.eval()
     
     # Create test environment
+    # CRITICAL: For deterministic evaluation, ensure no shuffling
+    # Use worker_init_fn to set random seed if needed, but IterableDataset shouldn't shuffle
     test_env_dataloader = DataLoader(
         dm.test_dataset,
         batch_size=1,
-        num_workers=0,
+        num_workers=0,  # Use 0 workers for deterministic ordering
         pin_memory=False,
-        drop_last=False
+        drop_last=False,
+        shuffle=False  # Ensure no shuffling (shouldn't matter for IterableDataset, but explicit)
     )
     test_env = TrackingEnv(
         test_env_dataloader,
         particle_filters=particle_filters,
         hit_filters=hit_filters,
         use_distance_reward=use_distance_reward,
-        use_truth_path_plan=use_truth_path_plan
+        use_truth_path_plan=use_truth_path_plan,
+        deterministic=True  # CRITICAL: Use deterministic ordering for evaluation reproducibility
     )
     
     # Create test agent (no replay buffer needed for evaluation)
@@ -216,7 +262,16 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     print(f"Particle filters: {particle_filters}")
     print(f"Hit filters: {hit_filters}")
     print(f"Using device: {device}")
+    print(f"Deterministic evaluation: particle order is sorted (not shuffled)")
     print(f"{'='*60}\n")
+    
+    # Set random seeds for reproducibility (if any randomness is used)
+    import random
+    random.seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+    torch.manual_seed(42)
     
     # Track-by-track evaluation metrics
     track_results = []
@@ -283,12 +338,30 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
             seed_hit_ids = set()
             termination_reason = 'unknown'  # Will be updated when track completes
             
+            # Verify this track should be included based on filters
+            # (This is a sanity check - filters should have been applied already)
+            track_pt_for_check = None
+            if hasattr(test_env, 'current_track') and test_env.current_track is not None:
+                # Get pt from track (should be the same for all hits in track)
+                track_pt_for_check = test_env.current_track['pt'].iloc[0] if len(test_env.current_track) > 0 else None
+                if track_pt_for_check is not None and particle_filters.get('pt', None) is not None:
+                    if track_pt_for_check <= particle_filters['pt']:
+                        print(f"⚠️  WARNING: Track {total_tracks} has pt={track_pt_for_check:.3f} which is <= filter threshold {particle_filters['pt']}")
+                        print(f"   This track should have been filtered out! This suggests a filter application issue.")
+            
             # Get track properties and seed hits
             track_pt = None
             track_eta = None
             if hasattr(test_env, 'current_track') and test_env.current_track is not None:
                 # Get all correct hit IDs for this track
                 correct_hit_ids = set(test_env.current_track['hit_id'].values)
+                
+                # CRITICAL: Use the TRUE pt from the particle's pt column, not the estimated helix.pt
+                # The helix.pt is estimated from seed hits and can differ from the true pt
+                # The filter uses the true pt column, so we should use the same for plotting
+                if 'pt' in test_env.current_track.columns and len(test_env.current_track) > 0:
+                    # All hits in a track should have the same pt (they're from the same particle)
+                    track_pt = float(test_env.current_track['pt'].iloc[0])
                 
                 # Get seed hits (first 3 hits from first 3 layers) - these should be excluded
                 if hasattr(test_env, 'helix') and test_env.helix is not None:
@@ -305,9 +378,13 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                             # If it's not a DataFrame, try to get hit_id attribute
                             seed_hit_ids = set()
                     
-                    # Get track pt and eta from helix
-                    if hasattr(test_env.helix, 'pt'):
+                    # Fallback: If track_pt wasn't set from current_track, use helix.pt (estimated)
+                    # But this should only happen if pt column is missing
+                    if track_pt is None and hasattr(test_env.helix, 'pt'):
                         track_pt = float(test_env.helix.pt)
+                        if total_tracks < 5:
+                            print(f"  WARNING: Using estimated helix.pt={track_pt:.3f} instead of true pt column")
+                    
                     if hasattr(test_env.helix, 'theta'):
                         # Convert theta to eta: eta = -ln(tan(theta/2))
                         theta = test_env.helix.theta
@@ -790,24 +867,43 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     plot_dir = Path(model_path).parent
     plot_dir.mkdir(exist_ok=True)
     
+    # Set CMS style for all plots
+    hep.style.use("CMS")
+    
     # Extract data for plotting
     track_times = [r['time'] for r in track_results]
-    track_pts = [r['pt'] for r in track_results if r['pt'] > 0]
+    
+    # CRITICAL: Filter tracks based on the pt filter threshold for plotting
+    # Only include tracks that actually pass the filter (pt > filter_threshold)
+    pt_filter_threshold = particle_filters.get('pt', None)
+    if pt_filter_threshold is not None:
+        # Only include tracks with pt > filter_threshold
+        track_pts = [r['pt'] for r in track_results if r['pt'] > pt_filter_threshold]
+        efficiencies_by_pt = [r['efficiency'] for r in track_results if r['pt'] > pt_filter_threshold]
+        pts_for_plot = [r['pt'] for r in track_results if r['pt'] > pt_filter_threshold]
+        
+        # Count how many tracks were filtered out
+        filtered_out_count = sum(1 for r in track_results if r['pt'] > 0 and r['pt'] <= pt_filter_threshold)
+        if filtered_out_count > 0:
+            print(f"⚠️  Filtered out {filtered_out_count} tracks with pt <= {pt_filter_threshold} from efficiency vs pt plot")
+    else:
+        # No pt filter, include all tracks with pt > 0
+        track_pts = [r['pt'] for r in track_results if r['pt'] > 0]
+        efficiencies_by_pt = [r['efficiency'] for r in track_results if r['pt'] > 0]
+        pts_for_plot = [r['pt'] for r in track_results if r['pt'] > 0]
+    
     track_etas = [r['eta'] for r in track_results if r['eta'] != 0]
-    efficiencies_by_pt = [r['efficiency'] for r in track_results if r['pt'] > 0]
     efficiencies_by_eta = [r['efficiency'] for r in track_results if r['eta'] != 0]
-    pts_for_plot = [r['pt'] for r in track_results if r['pt'] > 0]
     etas_for_plot = [r['eta'] for r in track_results if r['eta'] != 0]
     
     # Plot 1: Timing per track
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(len(track_times)), [t*1000 for t in track_times], 'b-', alpha=0.6)
-    plt.xlabel('Track Number')
-    plt.ylabel('Time per Track (ms)')
-    plt.title('Timing per Track')
-    plt.grid(True, alpha=0.3)
-    plt.axhline(y=np.mean(track_times)*1000, color='r', linestyle='--', label=f'Mean: {np.mean(track_times)*1000:.2f} ms')
-    plt.legend()
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(range(len(track_times)), [t*1000 for t in track_times], 'b-', alpha=0.6)
+    ax.set_xlabel('Track Number', fontsize=12)
+    ax.set_ylabel('Time per Track (ms)', fontsize=12)
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=np.mean(track_times)*1000, color='r', linestyle='--', label=f'Mean: {np.mean(track_times)*1000:.2f} ms')
+    ax.legend(fontsize=12)
     plt.tight_layout()
     plt.savefig(plot_dir / 'timing_per_track.png', dpi=150)
     plt.close()
@@ -815,27 +911,53 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     
     # Plot 2: Efficiency vs pt
     if len(track_pts) > 0:
-        plt.figure(figsize=(10, 6))
-        plt.scatter(pts_for_plot, efficiencies_by_pt, alpha=0.5, s=20)
-        plt.xlabel('Track pT (GeV/c)')
-        plt.ylabel('Tracking Efficiency')
-        plt.title('Tracking Efficiency vs Track pT')
-        plt.grid(True, alpha=0.3)
+        fig, ax = plt.subplots(figsize=(10, 6))
         
-        # Bin by pt for better visualization
-        if len(pts_for_plot) > 10:
-            pt_bins = np.linspace(min(pts_for_plot), max(pts_for_plot), 10)
+        pts_array = np.array(pts_for_plot)
+        efficiencies_array = np.array(efficiencies_by_pt)
+        
+        # Use logarithmic scale for pt
+        # Filter out negative or zero values for log scale
+        valid_mask = pts_array > 0
+        pts_valid = pts_array[valid_mask]
+        efficiencies_valid = efficiencies_array[valid_mask]
+        
+        ax.scatter(pts_valid, efficiencies_valid, alpha=0.5, s=20, label='Individual Tracks')
+        ax.set_xlabel('Track p$_T$ (GeV/c)', fontsize=12)
+        ax.set_ylabel('Tracking Efficiency', fontsize=12)
+        ax.set_xscale('log')  # Logarithmic x-axis
+        ax.grid(True, alpha=0.3, which='both')  # Show grid for both major and minor ticks
+        
+        # Add average efficiency text box
+        avg_eff_pt = np.mean(efficiencies_valid) if len(efficiencies_valid) > 0 else 0.0
+        ax.text(0.02, 0.98, f'Average Efficiency: {avg_eff_pt:.3f}', 
+                transform=ax.transAxes, fontsize=12,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        # Bin by pt for better visualization using logarithmic bins
+        if len(pts_valid) > 10:
+            # Use logarithmic bins for better distribution
+            n_bins = 20  # More bins
+            pt_min = np.min(pts_valid)
+            pt_max = np.max(pts_valid)
+            
+            # Create logarithmic bins
+            log_bins = np.logspace(np.log10(pt_min), np.log10(pt_max), n_bins + 1)
+            
             bin_means = []
             bin_centers = []
-            for i in range(len(pt_bins)-1):
-                mask = (np.array(pts_for_plot) >= pt_bins[i]) & (np.array(pts_for_plot) < pt_bins[i+1])
+            bin_counts = []
+            for i in range(len(log_bins)-1):
+                mask = (pts_valid >= log_bins[i]) & (pts_valid < log_bins[i+1])
                 if mask.sum() > 0:
-                    bin_means.append(np.mean(np.array(efficiencies_by_pt)[mask]))
-                    bin_centers.append((pt_bins[i] + pt_bins[i+1]) / 2)
+                    bin_means.append(np.mean(efficiencies_valid[mask]))
+                    # Geometric mean for bin center (appropriate for log scale)
+                    bin_centers.append(np.sqrt(log_bins[i] * log_bins[i+1]))
+                    bin_counts.append(mask.sum())
+            
             if len(bin_means) > 0:
-                plt.plot(bin_centers, bin_means, 'r-', linewidth=2, label='Binned Average')
-                plt.legend()
-        
+                ax.plot(bin_centers, bin_means, 'r-', linewidth=2, marker='o', markersize=6, label='Binned Average')
+                ax.legend(fontsize=12)
         plt.tight_layout()
         plt.savefig(plot_dir / 'efficiency_vs_pt.png', dpi=150)
         plt.close()
@@ -843,27 +965,39 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     
     # Plot 3: Efficiency vs eta
     if len(track_etas) > 0:
-        plt.figure(figsize=(10, 6))
-        plt.scatter(etas_for_plot, efficiencies_by_eta, alpha=0.5, s=20)
-        plt.xlabel('Track η')
-        plt.ylabel('Tracking Efficiency')
-        plt.title('Tracking Efficiency vs Track η')
-        plt.grid(True, alpha=0.3)
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        etas_array = np.array(etas_for_plot)
+        efficiencies_array = np.array(efficiencies_by_eta)
+        
+        ax.scatter(etas_array, efficiencies_array, alpha=0.5, s=20, label='Individual Tracks')
+        ax.set_xlabel('Track η', fontsize=12)
+        ax.set_ylabel('Tracking Efficiency', fontsize=12)
+        ax.grid(True, alpha=0.3)
+        
+        # Add average efficiency text box
+        avg_eff_eta = np.mean(efficiencies_array) if len(efficiencies_array) > 0 else 0.0
+        ax.text(0.02, 0.98, f'Average Efficiency: {avg_eff_eta:.3f}', 
+                transform=ax.transAxes, fontsize=12,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         # Bin by eta for better visualization
         if len(etas_for_plot) > 10:
-            eta_bins = np.linspace(min(etas_for_plot), max(etas_for_plot), 10)
+            n_bins = 15  # More bins
+            eta_bins = np.linspace(min(etas_array), max(etas_array), n_bins + 1)
             bin_means = []
             bin_centers = []
+            bin_counts = []
             for i in range(len(eta_bins)-1):
-                mask = (np.array(etas_for_plot) >= eta_bins[i]) & (np.array(etas_for_plot) < eta_bins[i+1])
+                mask = (etas_array >= eta_bins[i]) & (etas_array < eta_bins[i+1])
                 if mask.sum() > 0:
-                    bin_means.append(np.mean(np.array(efficiencies_by_eta)[mask]))
+                    bin_means.append(np.mean(efficiencies_array[mask]))
                     bin_centers.append((eta_bins[i] + eta_bins[i+1]) / 2)
+                    bin_counts.append(mask.sum())
             if len(bin_means) > 0:
-                plt.plot(bin_centers, bin_means, 'r-', linewidth=2, label='Binned Average')
-                plt.legend()
-        
+                # Show data points on binned average (like pt plot)
+                ax.plot(bin_centers, bin_means, 'r-', linewidth=2, marker='o', markersize=6, label='Binned Average')
+                ax.legend(fontsize=12)
         plt.tight_layout()
         plt.savefig(plot_dir / 'efficiency_vs_eta.png', dpi=150)
         plt.close()
