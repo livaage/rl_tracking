@@ -28,7 +28,7 @@ model:
 # Environment Filters
 environment:
   particle_filters:
-    pt: 1
+    pt: 0.5
     nhits_min: 4
     nhits_max: 20
   hit_filters: {}  # No hit filtering by default

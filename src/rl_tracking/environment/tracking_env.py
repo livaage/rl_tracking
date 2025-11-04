@@ -23,6 +23,7 @@ class TrackingEnv:
         use_truth_path_plan=False,  # Use truth-level path plan (all layers in track) instead of lookup
         max_layer_skip=4,  # Max layers to skip ahead when looking for compatible hits
         tolerance_r=2.0,  # Distance tolerance in cm for finding compatible hits
+        deterministic=False,  # If True, use deterministic particle ordering (for evaluation)
     ):
         """
         Initialize the environment with a data loader.
@@ -51,6 +52,7 @@ class TrackingEnv:
         self.use_truth_path_plan = use_truth_path_plan
         self.max_layer_skip = max_layer_skip
         self.tolerance_r = tolerance_r
+        self.deterministic = deterministic  # For deterministic evaluation
         
         # Track distances for statistics
         self.distance_history = []
@@ -104,7 +106,13 @@ class TrackingEnv:
         selected_particles = hits['particle_id'].unique()
         
         self.pids_to_explore = list(selected_particles)
-        np.random.shuffle(self.pids_to_explore)
+        # CRITICAL: For deterministic evaluation, sort instead of shuffle
+        # Shuffling causes different results on each evaluation run
+        # For training, shuffling is fine (adds randomness), but for evaluation we need determinism
+        if self.deterministic:
+            self.pids_to_explore.sort()  # Deterministic sorting for evaluation
+        else:
+            np.random.shuffle(self.pids_to_explore)  # Random shuffle for training
     
     def _apply_hit_filters(self, hits):
         """
