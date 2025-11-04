@@ -8,11 +8,17 @@ from pathlib import Path
 import re
 import os
 import torch
+from rl_tracking.utils.logger import get_logger
+
+logger = get_logger()
 # TODO read features from a config file
 
 DEFAULT_FEATURES = ["r", "z", "prev_z", "prev_r"]
 DEFAULT_NUM_COMPATIBLE_HITS = 3
-LAYER_REMAPPING = pd.read_csv('tml_layer_remap.csv')
+
+# Load layer remapping file using path relative to package root
+LAYER_REMAPPING_PATH = Path(__file__).parent.parent / 'tml_layer_remap.csv'
+LAYER_REMAPPING = pd.read_csv(LAYER_REMAPPING_PATH)
 
 @dataclass
 class EventProcessor:
@@ -71,9 +77,30 @@ class EventProcessor:
         pass
 
     def _add_cols(self):
-        self.hits = self.hits.merge(LAYER_REMAPPING.drop(['Unnamed: 0'], axis=1),
-                                                               on=['volume_id', 'layer_id'], how = 'left')
-        print(self.hits)
+        # Drop the Unnamed: 0 column if it exists
+        remapping_cols = LAYER_REMAPPING.drop(['Unnamed: 0'], axis=1, errors='ignore') if 'Unnamed: 0' in LAYER_REMAPPING.columns else LAYER_REMAPPING
+        
+        # Check for missing volume_id/layer_id combinations
+        unique_vol_layers = self.hits[['volume_id', 'layer_id']].drop_duplicates()
+        remapped_vol_layers = remapping_cols[['volume_id', 'layer_id']].drop_duplicates()
+        
+        missing = unique_vol_layers.merge(remapped_vol_layers, on=['volume_id', 'layer_id'], how='left', indicator=True)
+        missing = missing[missing['_merge'] == 'left_only'][['volume_id', 'layer_id']]
+        
+        if len(missing) > 0:
+            logger.warning(f"{len(missing)} volume_id/layer_id combinations not found in remapping:")
+            logger.warning(str(missing.head(10)))
+        
+        self.hits = self.hits.merge(remapping_cols, on=['volume_id', 'layer_id'], how='left')
+        
+        # Check for NaN unique_layer_ids
+        nan_count = self.hits['unique_layer_id'].isna().sum()
+        if nan_count > 0:
+            logger.warning(f"{nan_count} hits have NaN unique_layer_id after remapping")
+            nan_vol_layers = self.hits[self.hits['unique_layer_id'].isna()][['volume_id', 'layer_id']].drop_duplicates()
+            logger.warning(f"Missing combinations: {nan_vol_layers}")
+        
+        logger.debug(f"Remapping applied: {len(self.hits)} hits, unique_layer_id range: [{self.hits['unique_layer_id'].min():.0f}, {self.hits['unique_layer_id'].max():.0f}]")
         self.hits['theta'] = np.arctan2(self.hits.r, self.hits.z)
         self.hits['phi'] = np.arctan2(self.hits.y, self.hits.x)
 
@@ -82,17 +109,25 @@ class EventProcessor:
         try:
             hits, cells, particles, truth = load_event(filename)
         except FileNotFoundError:
-            print(f"Error: The file '{filename}' does not exist.")
+            logger.error(f"Error: The file '{filename}' does not exist.")
             raise
         except IOError as e:
-            print(f"Error: An I/O error occurred while reading the file '{filename}'.")
-            print(f"Details: {e}")
+            logger.error(f"Error: An I/O error occurred while reading the file '{filename}'.")
+            logger.error(f"Details: {e}")
             raise
 
         hits = hits.merge(truth, on='hit_id')
         self.hits = hits.merge(particles, on='particle_id')
+        
+        # TrackML uses mm, but layer_info.csv and propagation expect cm
+        # Convert positions from mm to cm
+        self.hits['x'] = self.hits['x'] * 0.1  # mm to cm
+        self.hits['y'] = self.hits['y'] * 0.1  # mm to cm
+        self.hits['z'] = self.hits['z'] * 0.1  # mm to cm
+        
         self.hits['r'] = np.sqrt(self.hits['x'] ** 2 + self.hits['y'] ** 2)
         self.hits["pt"] = np.sqrt(self.hits.px ** 2 + self.hits.py ** 2)
+        logger.debug(f"Hits statistics:\n{self.hits.describe()}")
         self.hits = self.hits.sort_values(['r', 'z'])
         self._add_cols()
 

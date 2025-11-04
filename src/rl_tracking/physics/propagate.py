@@ -16,9 +16,22 @@ layer_info = pd.read_csv('/Users/liv/rl_tracking/src/rl_tracking/physics/layer_i
 #path_plans = pd.read_pickle(BASE_DIR+'/utils/theta_path_plan.pkl')
 
 
-def propagate_and_get_comp_hits(helix, layer, hit_holder): 
-
-    comps = propagate_helix_to_layer(helix, layer, hit_holder)
+def propagate_and_get_comp_hits(helix, layer, hit_holder, tolerance_r=1.0): 
+    """
+    Propagate helix to a layer and find compatible hits.
+    
+    Args:
+        helix: Helix object to propagate
+        layer: Target layer ID (unique_layer_id)
+        hit_holder: HitHolder instance with all hits
+        tolerance_r: Distance tolerance in cm for finding compatible hits.
+                    Hits within this 3D distance from the propagated position
+                    are considered compatible. Default is 1.0 cm.
+    
+    Returns:
+        DataFrame of compatible hits
+    """
+    comps = propagate_helix_to_layer(helix, layer, hit_holder, tolerance_r=tolerance_r)
 
     helix.current_layer = layer
     
@@ -27,7 +40,7 @@ def propagate_and_get_comp_hits(helix, layer, hit_holder):
 
 
 
-def propagate_helix_to_layer(helix, layer_id, hit_holder): 
+def propagate_helix_to_layer(helix, layer_id, hit_holder, tolerance_r=1.0): 
     
     # layer_id should be the unique_layer_id from path_plan
     # Debug: show what we're receiving
@@ -49,7 +62,7 @@ def propagate_helix_to_layer(helix, layer_id, hit_holder):
         # Position after propagation
         pos_after = (helix.x, helix.y, helix.z)
         
-        comps = hit_holder.find_close_hits(helix, 1, 0, target_layer=original_layer_id)
+        comps = hit_holder.find_close_hits(helix, tolerance_r, 0, target_layer=original_layer_id)
         
         # Debug output
         logger.debug(f"\n[PROPAGATION DEBUG] Layer {original_layer_id} (R propagation)")

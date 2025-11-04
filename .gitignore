@@ -1,5 +1,45 @@
-__pycache__
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
 
-src/rl_tracking/training/lightning_logs
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
 
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+*.DS_Store
+
+# Training outputs
+src/rl_tracking/training/lightning_logs/
 src/rl_tracking/training/test.csv
+src/rl_tracking/training/RLTracking/
+src/rl_tracking/training/wandb/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files (if large)
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Logs
+*.logfmt

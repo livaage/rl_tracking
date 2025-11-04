@@ -19,7 +19,7 @@ class HitHolder:
         """
         self.hits = hits_df
     
-    def find_close_hits(self, helix, tolerance_r=1, tolerance_z=0, target_layer=None, debug=True):
+    def find_close_hits(self, helix, tolerance_r=2, tolerance_z=0, target_layer=None, debug=True):
         """
         Find hits close to the helix position in 3D space.
         

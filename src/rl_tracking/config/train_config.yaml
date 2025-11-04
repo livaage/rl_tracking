@@ -1,0 +1,67 @@
+# Training Configuration File
+# This file contains all hyperparameters and settings for training
+
+# Data Configuration
+data:
+  data_dir: "/Users/liv/trackML/train_1/"
+  batch_size: 32
+  val_split: 0.2  # Validation split (for train/val split)
+  test_split: 0.1  # Test split (separate from train/val)
+  num_workers: 0
+  event_processor:
+    n_neighbors: 20
+
+# Model Hyperparameters
+model:
+  batch_size: 32
+  lr: 0.0005  # Moderate learning rate - balance between stability and speed
+  gamma: 0.99
+  sync_rate: 10  # How often to update target network
+  replay_size: 10000  # Increased from 1000 for more diverse experience replay
+  warm_start_size: 1000
+  eps_last_frame: 5000  # Reduced from 10000 - faster transition to exploitation
+  eps_start: 1.0
+  eps_end: 0.01  # Reduced exploration at end (was 0.05) to better exploit learned policy
+  episode_length: 200
+  warm_start_steps: 2000  # Increased from 1000 to populate buffer better
+
+# Environment Filters
+environment:
+  particle_filters:
+    pt: 1
+    nhits_min: 4
+    nhits_max: 20
+  hit_filters: {}  # No hit filtering by default
+  # Example with hit filters:
+  # hit_filters:
+  #   exclude_volumes: [7, 8, 9]
+  #   exclude_layers: []
+  use_distance_reward: false  # Set to true to use distance-based reward instead of binary
+  use_truth_path_plan: true  # Set to true to use truth-level path plan (all layers in track) instead of lookup-based path plan
+
+# Trainer Configuration
+trainer:
+  max_epochs: 5000
+  accelerator: "auto"  # Use GPU if available, otherwise CPU
+  log_every_n_steps: 10
+  gradient_clip_val: 10.0  # Clip gradients to prevent exploding gradients
+  callbacks:
+    checkpoint:
+      monitor: "val_loss"
+      save_top_k: 1
+      mode: "min"
+      filename: "best-{epoch:02d}-{val_loss:.4f}"
+      save_last: true  # Also save the last checkpoint
+    early_stopping:
+      monitor: "val_hit_accuracy"  # Monitor validation accuracy (with epsilon=0, tracks true policy quality)
+      mode: "max"  # Stop when accuracy stops increasing
+      patience: 50  # Wait 50 validation checks before stopping
+      min_delta: 0.001  # Minimum improvement to count as progress
+      check_val_every_n_epoch: 1  # Check validation every epoch
+
+# Wandb Configuration
+wandb:
+  project: "RLTracking"
+  name: "ptcut1_initial_run"
+  log_model: true
+
