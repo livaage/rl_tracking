@@ -1,0 +1,66 @@
+# Multi-Agent Training Configuration File
+# Configuration for simultaneous track propagation with multiple agents
+
+# Data Configuration
+data:
+  data_dir: "/Users/liv/trackML/train_1/"
+  batch_size: 32
+  val_split: 0.2
+  test_split: 0.1
+  num_workers: 0
+  event_processor:
+    n_neighbors: 20
+
+# Model Hyperparameters
+model:
+  num_agents: 10  # Number of agents (tracks) to propagate simultaneously
+  batch_size: 32
+  lr: 0.0005
+  gamma: 0.99
+  sync_rate: 10
+  replay_size: 10000
+  warm_start_size: 1000
+  eps_last_frame: 5000
+  eps_start: 1.0
+  eps_end: 0.01
+  episode_length: 200
+  warm_start_steps: 2000
+
+# Environment Filters
+environment:
+  particle_filters:
+    pt: 0.5
+    nhits_min: 4
+    nhits_max: 20
+  hit_filters: {}
+  use_distance_reward: false
+  use_truth_path_plan: true
+  proximity_threshold: 50.0  # Group tracks within this distance (cm)
+
+# Trainer Configuration
+trainer:
+  max_epochs: 5000
+  accelerator: "auto"
+  log_every_n_steps: 10
+  gradient_clip_val: 10.0
+  callbacks:
+    checkpoint:
+      monitor: "val_loss"
+      save_top_k: 1
+      mode: "min"
+      filename: "best-{epoch:02d}-{val_loss:.4f}"
+      save_last: true
+    early_stopping:
+      monitor: "val_hit_accuracy"
+      mode: "max"
+      patience: 50
+      min_delta: 0.001
+      check_val_every_n_epoch: 1
+
+# Wandb Configuration
+wandb:
+  project: "RLTracking"
+  name: "multiagent_initial_run"
+  log_model: true
+
+
