@@ -776,6 +776,7 @@ class DQNLightning(LightningModule):
         val_losses = []
         val_accuracies = []
         val_rewards_list = []
+        rank_metrics = {}
         
         with torch.no_grad():
             # Save current environment state
@@ -789,6 +790,10 @@ class DQNLightning(LightningModule):
             if hasattr(val_env, 'total_selections'):
                 val_env.total_selections = 0
                 val_env.correct_selections = 0
+            if hasattr(val_env, 'rank_selection_counts'):
+                val_env.rank_selection_counts.clear()
+            if hasattr(val_env, 'rank_correct_counts'):
+                val_env.rank_correct_counts.clear()
             
             # Track validation episode statistics
             val_termination_reasons = []
@@ -922,12 +927,61 @@ class DQNLightning(LightningModule):
         # Log validation accuracy (evaluated with epsilon=0, so this tracks true policy quality)
         if len(val_accuracies) > 0:
             avg_val_accuracy = sum(val_accuracies) / len(val_accuracies)
-            self.log("val_hit_accuracy", avg_val_accuracy, on_step=False, on_epoch=True, prog_bar=True)
-            
+        else:
+            avg_val_accuracy = 0.0
+        self.log(
+            "val_hit_accuracy",
+            avg_val_accuracy,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+        )
+        if len(val_accuracies) > 0:
             # Track validation accuracy statistics
             self.log("val_accuracy_max", max(val_accuracies), on_step=False, on_epoch=True)
             self.log("val_accuracy_min", min(val_accuracies), on_step=False, on_epoch=True)
             self.log("val_accuracy_std", float(np.std(val_accuracies)), on_step=False, on_epoch=True)
+        else:
+            self.log("val_accuracy_max", 0.0, on_step=False, on_epoch=True)
+            self.log("val_accuracy_min", 0.0, on_step=False, on_epoch=True)
+            self.log("val_accuracy_std", 0.0, on_step=False, on_epoch=True)
+
+        if hasattr(val_env, 'get_rank_selection_metrics'):
+            rank_metrics = val_env.get_rank_selection_metrics()
+            for rank, stats in rank_metrics.items():
+                total = float(stats.get("total", 0))
+                correct = float(stats.get("correct", 0))
+                accuracy = float(stats.get("accuracy", 0.0))
+                # Avoid flooding logs with empty ranks
+                if total <= 0:
+                    continue
+                self.log(
+                    f"val_rank_{rank}_accuracy",
+                    accuracy,
+                    on_step=False,
+                    on_epoch=True,
+                )
+                self.log(
+                    f"val_rank_{rank}_selections",
+                    total,
+                    on_step=False,
+                    on_epoch=True,
+                )
+                self.log(
+                    f"val_rank_{rank}_correct",
+                    correct,
+                    on_step=False,
+                    on_epoch=True,
+                )
+
+            if rank_metrics:
+                rank_summary = ", ".join(
+                    f"{rank}:{stats['accuracy']:.3f} ({int(stats['correct'])}/{int(stats['total'])})"
+                    for rank, stats in sorted(rank_metrics.items())
+                    if stats.get("total", 0)
+                )
+                if rank_summary:
+                    self.print(f"[val] rank accuracy: {rank_summary}")
         elif hasattr(val_env, 'total_selections') and val_env.total_selections > 0:
             # Single episode accuracy
             current_val_accuracy = val_env.correct_selections / val_env.total_selections

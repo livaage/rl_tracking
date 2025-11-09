@@ -1,27 +1,33 @@
 """Animation script to visualize track reconstruction step by step."""
+import argparse
+import itertools
+import json
+import re
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import torch
 from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-import torch
-from pathlib import Path
-import argparse
-import itertools
 
 from rl_tracking.lightning_modules.dqn import DQNLightning
 from rl_tracking.preprocessing.hit_candidates import EventProcessor
 from rl_tracking.utils.stream_loading import TrackingDataModule
 from rl_tracking.utils.config_loader import load_config
+from rl_tracking.utils.data_paths import resolve_data_directories
 from rl_tracking.environment.tracking_env import TrackingEnv
 from rl_tracking.environment.agent import Agent
+
+DEFAULT_TRACKML_DIR = Path("/scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data/part_1")
 
 
 class TrackAnimator:
     """Animates track reconstruction step by step."""
     
-    def __init__(self, model_path, config_path=None, test_data_dir=None):
+    def __init__(self, model_path, config_path=None, test_data_dir=None, highlight_hit_ids=None):
         """Initialize animator with model and data."""
         # Load configuration
         if config_path is None:
@@ -36,11 +42,24 @@ class TrackAnimator:
         environment_config = config.get('environment', {})
         
         # Extract configurations
-        self.data_dir = Path(data_config.get('data_dir', '/Users/liv/trackML/train_1/'))
+        data_config_override = dict(data_config) if data_config else {}
+        if test_data_dir is not None:
+            data_config_override['data_dir'] = test_data_dir
+
+        self.data_root, self.data_directories = resolve_data_directories(
+            data_config_override,
+            default_dir=DEFAULT_TRACKML_DIR,
+        )
+
+        print("Using TrackML data directories for animation:")
+        for directory in self.data_directories:
+            print(f"  - {directory}")
+
         batch_size = data_config.get('batch_size', 32)
         val_split = data_config.get('val_split', 0.2)
         test_split = data_config.get('test_split', 0.1)
         num_workers = data_config.get('num_workers', 0)
+        random_seed = data_config.get('random_seed', 42)
         event_processor_config = data_config.get('event_processor', {})
         n_neighbors = event_processor_config.get('n_neighbors', 20)
         
@@ -50,14 +69,15 @@ class TrackAnimator:
         use_truth_path_plan = environment_config.get('use_truth_path_plan', False)
         
         # Initialize data module
-        ep = EventProcessor(self.data_dir, n_neighbors)
+        ep = EventProcessor(self.data_root, n_neighbors)
         self.dm = TrackingDataModule(
-            file_paths=self.data_dir,
+            file_paths=self.data_directories,
             batch_size=batch_size,
             event_processor=ep,
             num_workers=num_workers,
             val_split=val_split,
-            test_split=test_split
+            test_split=test_split,
+            random_seed=random_seed,
         )
         
         # Setup datamodule for both fit and test (model needs train_dataset during init)
@@ -74,6 +94,9 @@ class TrackAnimator:
             use_truth_path_plan=use_truth_path_plan,
         )
         self.model.eval()
+        self.highlight_hit_ids = {
+            int(hit_id) for hit_id in (highlight_hit_ids or [])
+        }
         
         # Create test environment using test dataset
         # TrackingEnv expects an iterator that yields numpy arrays/tensors
@@ -395,10 +418,43 @@ class TrackAnimator:
             # Only plot post-seed truth hits (no overlap with seed)
             # Use brighter blue (cyan) for better visibility on black
             post_seed_truth = truth_hits[~truth_hits['hit_id'].isin(seed_hit_ids)]
-            if len(post_seed_truth) > 0:
-                # Transform coordinates: x->y, y->z, z->x
-                ax_3d.scatter(post_seed_truth['y'], post_seed_truth['z'], post_seed_truth['x'],
-                          c='cyan', s=50, marker='o', label='Truth hits', alpha=0.6, edgecolors='white', linewidths=0.5, zorder=1)
+            highlight_set = getattr(self, "highlight_hit_ids", set())
+            highlight_truth = pd.DataFrame()
+            base_truth = post_seed_truth
+            if highlight_set and len(post_seed_truth) > 0:
+                mask = post_seed_truth['hit_id'].apply(
+                    lambda hit: False if pd.isna(hit) else int(hit) in highlight_set
+                )
+                highlight_truth = post_seed_truth[mask]
+                base_truth = post_seed_truth[~mask]
+            if len(base_truth) > 0:
+                ax_3d.scatter(
+                    base_truth['y'],
+                    base_truth['z'],
+                    base_truth['x'],
+                    c='cyan',
+                    s=50,
+                    marker='o',
+                    label='Truth hits',
+                    alpha=0.6,
+                    edgecolors='white',
+                    linewidths=0.5,
+                    zorder=1,
+                )
+            if len(highlight_truth) > 0:
+                ax_3d.scatter(
+                    highlight_truth['y'],
+                    highlight_truth['z'],
+                    highlight_truth['x'],
+                    c='yellow',
+                    s=120,
+                    marker='o',
+                    label='Highlighted truth hits',
+                    alpha=0.9,
+                    edgecolors='white',
+                    linewidths=1.5,
+                    zorder=4,
+                )
             
             # Plot seed hits on top (higher zorder) so they're always visible
             if seed_hits is not None and len(seed_hits) > 0:
@@ -413,12 +469,36 @@ class TrackAnimator:
             # Plot all truth hits in 2D RZ view (seed and post-seed separately)
             # Convention: z on x-axis, r on y-axis
             # Plot truth hits first, then seed hits on top
-            if len(post_seed_truth) > 0:
-                post_seed_r = np.sqrt(post_seed_truth['x']**2 + post_seed_truth['y']**2)
-                post_seed_z = post_seed_truth['z'].values
-                # Use brighter blue (cyan) for better visibility on black
-                ax_2d.scatter(post_seed_z, post_seed_r, c='cyan', s=40, alpha=0.7, 
-                             label='Truth hits', marker='o', edgecolors='white', linewidths=0.5, zorder=1)
+            if len(base_truth) > 0:
+                post_seed_r = np.sqrt(base_truth['x']**2 + base_truth['y']**2)
+                post_seed_z = base_truth['z'].values
+                ax_2d.scatter(
+                    post_seed_z,
+                    post_seed_r,
+                    c='cyan',
+                    s=40,
+                    alpha=0.7,
+                    label='Truth hits',
+                    marker='o',
+                    edgecolors='white',
+                    linewidths=0.5,
+                    zorder=1,
+                )
+            if len(highlight_truth) > 0:
+                highlight_r = np.sqrt(highlight_truth['x']**2 + highlight_truth['y']**2)
+                highlight_z = highlight_truth['z'].values
+                ax_2d.scatter(
+                    highlight_z,
+                    highlight_r,
+                    c='yellow',
+                    s=70,
+                    alpha=0.95,
+                    label='Highlighted truth hits',
+                    marker='o',
+                    edgecolors='white',
+                    linewidths=1.5,
+                    zorder=4,
+                )
             
             # Plot seed hits on top (higher zorder) so they're always visible
             if seed_hits is not None and len(seed_hits) > 0:
@@ -561,6 +641,46 @@ class TrackAnimator:
                                 comp_hits.loc[wrong_indices, 'x'],
                                 c='gray', s=100, marker='^', 
                                 label='Compatible (wrong)', alpha=0.75, edgecolors='white', linewidths=1, zorder=2)
+                
+                if highlight_set:
+                    highlight_indices = []
+                    for idx, hit_id in zip(comp_hits.index, comp_hits['hit_id'].values):
+                        try:
+                            if int(hit_id) in highlight_set:
+                                highlight_indices.append(idx)
+                        except Exception:
+                            continue
+                    if len(highlight_indices) > 0:
+                        ax_3d.scatter(
+                            comp_hits.loc[highlight_indices, 'y'],
+                            comp_hits.loc[highlight_indices, 'z'],
+                            comp_hits.loc[highlight_indices, 'x'],
+                            c='yellow',
+                            s=160,
+                            marker='o',
+                            label='Highlighted hits',
+                            alpha=0.95,
+                            edgecolors='black',
+                            linewidths=1.2,
+                            zorder=5,
+                        )
+                        highlight_r = np.sqrt(
+                            comp_hits.loc[highlight_indices, 'x']**2
+                            + comp_hits.loc[highlight_indices, 'y']**2
+                        )
+                        highlight_z = comp_hits.loc[highlight_indices, 'z']
+                        ax_2d.scatter(
+                            highlight_z,
+                            highlight_r,
+                            c='yellow',
+                            s=180,
+                            marker='o',
+                            alpha=0.95,
+                            edgecolors='black',
+                            linewidths=1.5,
+                            label='Highlighted hits',
+                            zorder=5,
+                        )
             
             # Plot selected hit in 3D
             if frame['selected_hit'] is not None:
@@ -592,6 +712,10 @@ class TrackAnimator:
                 sel_color = 'green' if frame['selected_hit_correct'] else 'red'
                 sel_marker = 'D' if frame['selected_hit_correct'] else 'X'
                 sel_label = 'Selected (correct)' if frame['selected_hit_correct'] else 'Selected (wrong)'
+                if highlight_set and frame['selected_hit_id'] is not None and frame['selected_hit_id'] in highlight_set:
+                    sel_color = 'yellow'
+                    sel_marker = 'o'
+                    sel_label = 'Selected (highlighted)'
                 # Use smaller marker size so other hits are more visible
                 # Transform coordinates: x->y, y->z, z->x
                 ax_3d.scatter([sel_y], [sel_z], [sel_x], c=sel_color, s=150, marker=sel_marker,
@@ -778,11 +902,29 @@ def main():
                        help='Frames per second (default: 2)')
     parser.add_argument('--num_tracks', '--num_particles', type=int, default=3,
                        help='Number of tracks/particles to animate (default: 3)')
+    parser.add_argument('--highlight-hit-ids', type=str, default=None,
+                       help='Path to file containing hit IDs to highlight (JSON array or comma/space-separated text)')
     
     args = parser.parse_args()
     
+    highlight_hit_ids = None
+    if args.highlight_hit_ids:
+        highlight_path = Path(args.highlight_hit_ids)
+        try:
+            text = highlight_path.read_text(encoding='utf-8').strip()
+            if not text:
+                highlight_hit_ids = []
+            elif highlight_path.suffix.lower() == '.json':
+                highlight_hit_ids = json.loads(text)
+            else:
+                tokens = [tok for tok in re.split(r'[\s,]+', text) if tok]
+                highlight_hit_ids = [int(tok) for tok in tokens]
+        except Exception as exc:
+            print(f"Failed to load highlight hit IDs from {highlight_path}: {exc}")
+            highlight_hit_ids = []
+    
     # Create animator
-    animator = TrackAnimator(args.model, args.config)
+    animator = TrackAnimator(args.model, args.config, highlight_hit_ids=highlight_hit_ids)
     
     # Collect track data
     print(f"Collecting data for track {args.track}...")

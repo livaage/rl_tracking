@@ -3,11 +3,15 @@
 
 # Data Configuration
 data:
-  data_dir: "/Users/liv/trackML/train_1/"
+  data_dir: "/scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data/part_1"
+  base_dir: "/scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data"
+  include_all_parts: true
+  parts_glob: "part_*"
   batch_size: 32
   val_split: 0.2
   test_split: 0.1
   num_workers: 0
+  random_seed: 42
   event_processor:
     n_neighbors: 20
 
@@ -40,7 +44,8 @@ environment:
 # Trainer Configuration
 trainer:
   max_epochs: 5000
-  accelerator: "auto"
+  accelerator: "gpu"
+  devices: 1
   log_every_n_steps: 10
   gradient_clip_val: 10.0
   callbacks:

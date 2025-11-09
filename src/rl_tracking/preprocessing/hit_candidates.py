@@ -16,8 +16,35 @@ logger = get_logger()
 DEFAULT_FEATURES = ["r", "z", "prev_z", "prev_r"]
 DEFAULT_NUM_COMPATIBLE_HITS = 3
 
-# Load layer remapping file using path relative to package root
-LAYER_REMAPPING_PATH = Path(__file__).parent.parent / 'tml_layer_remap.csv'
+GEOMETRY_DIR = Path(__file__).resolve().parent.parent / 'geometry'
+
+
+def _resolve_geometry_path(filename: str) -> Path:
+    """
+    Resolve geometry assets with graceful fallback to the package root.
+
+    Args:
+        filename: Name of the geometry file.
+
+    Returns:
+        Path to the requested file.
+
+    Raises:
+        FileNotFoundError: If the file cannot be found.
+    """
+    candidates = [
+        GEOMETRY_DIR / filename,
+        Path(__file__).resolve().parent.parent / filename,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    searched = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"Could not locate '{filename}'. Locations checked: {searched}")
+
+
+# Load layer remapping file using shared geometry directory
+LAYER_REMAPPING_PATH = _resolve_geometry_path('tml_layer_remap.csv')
 LAYER_REMAPPING = pd.read_csv(LAYER_REMAPPING_PATH)
 
 @dataclass

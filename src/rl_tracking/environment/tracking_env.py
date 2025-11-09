@@ -1,3 +1,5 @@
+from collections import Counter
+
 import numpy as np
 import pandas as pd
 from gymnasium.spaces import Box, Discrete
@@ -7,10 +9,12 @@ from rl_tracking.utils.logger import get_logger
 
 logger = get_logger()
 
-COLS = ['hit_id', 'x', 'y', 'z', 'volume_id', 'layer_id', 'module_id',
-       'particle_id', 'tx', 'ty', 'tz', 'tpx', 'tpy', 'tpz', 'weight', 'vx',
-       'vy', 'vz', 'px', 'py', 'pz', 'q', 'nhits', 'r', 'pt',
-        'unique_layer_id', 'phi', 'theta']
+COLS = [
+    'hit_id', 'x', 'y', 'z', 'volume_id', 'layer_id', 'module_id',
+    'particle_id', 'tx', 'ty', 'tz', 'tpx', 'tpy', 'tpz', 'weight', 'particle_type',
+    'vx', 'vy', 'vz', 'px', 'py', 'pz', 'q', 'nhits', 'r', 'pt',
+    'unique_layer_id', 'theta', 'phi'
+]
 
 
 class TrackingEnv:
@@ -73,6 +77,8 @@ class TrackingEnv:
         self.total_selections = 0
         self.correct_selections = 0
         self.correct_hit_ids_set = set()  # For quick lookup
+        self.rank_selection_counts = Counter()
+        self.rank_correct_counts = Counter()
         
         # Store last selected hit for evaluation tracking
         self.last_selected_hit = None
@@ -397,6 +403,9 @@ class TrackingEnv:
                 self.total_selections += 1
                 if is_correct_selection:
                     self.correct_selections += 1
+                self.rank_selection_counts[action_idx] += 1
+                if is_correct_selection:
+                    self.rank_correct_counts[action_idx] += 1
             
             # Store selected hit for evaluation tracking
             self.last_selected_hit = selected_hit
@@ -482,3 +491,18 @@ class TrackingEnv:
     def calculate_reward(self, state):
         """Placeholder for reward logic (adjust based on your task)."""
         return 1 if state is not None else 0  # Example: reward for valid step
+
+    def get_rank_selection_metrics(self):
+        """
+        Return selection statistics keyed by candidate rank.
+        """
+        metrics = {}
+        for rank, total in self.rank_selection_counts.items():
+            correct = self.rank_correct_counts.get(rank, 0)
+            accuracy = correct / total if total else 0.0
+            metrics[int(rank)] = {
+                "total": total,
+                "correct": correct,
+                "accuracy": accuracy,
+            }
+        return metrics

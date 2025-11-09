@@ -43,7 +43,7 @@ This project uses Poetry for dependency management:
 
 ```bash
 # Navigate to the project root directory
-cd /Users/liv/rl_tracking
+cd /home/lv7805/rl_tracking
 
 # Install dependencies
 poetry install
@@ -56,7 +56,7 @@ poetry shell
 
 ```bash
 # Navigate to the project root directory (NOT the training subdirectory)
-cd /Users/liv/rl_tracking
+cd /home/lv7805/rl_tracking
 
 # Install in development mode
 pip install -e .
@@ -65,13 +65,13 @@ pip install -e .
 pip install --user -e .
 ```
 
-**Important:** Make sure you're in the `/Users/liv/rl_tracking` directory (where `pyproject.toml` and `setup.py` are located), NOT in the `training/` subdirectory.
+**Important:** Make sure you're in the `/home/lv7805/rl_tracking` directory (where `pyproject.toml` and `setup.py` are located), NOT in the `training/` subdirectory.
 
 #### Troubleshooting
 
 **Error: "file does not appear to be a Python project"**
 - You're in the wrong directory! The project root should contain both `pyproject.toml` and `setup.py`
-- Navigate to the project root: `cd /Users/liv/rl_tracking`
+- Navigate to the project root: `cd /home/lv7805/rl_tracking`
 - Then run `pip install -e .`
 
 **Error: "trackml" module not found**
@@ -97,8 +97,8 @@ pip install --user -e .
 Start training by running the main training script:
 
 ```bash
-cd /Users/liv/rl_tracking/src/rl_tracking/training
-python train.py
+cd /home/lv7805/rl_tracking/src/rl_tracking/training
+python train.py --config ../config/train_config.yaml
 ```
 
 The training script will:
@@ -109,13 +109,15 @@ The training script will:
 
 ### Configuration
 
-You can modify training parameters in `training/train.py`:
-- `batch_size`: Batch size for training
-- `lr`: Learning rate
-- `gamma`: Discount factor for RL
-- `replay_size`: Size of experience replay buffer
-- `max_epochs`: Number of training epochs
-- Data directory path for TrackML data
+Core settings live in `src/rl_tracking/config/train_config.yaml`:
+- `data.base_dir`: Root directory that contains the TrackML `part_*` folders (defaults to `/scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data`)
+- `data.parts_glob`: Glob pattern (default `part_*`) used to gather every partition automatically
+- `data.include_all_parts`: When `true`, all matching partitions are included without manual edits
+- `trainer.accelerator`: Set to `gpu` by default; Lightning will fall back to CPU if no GPU is available
+- `trainer.devices`: Number of GPUs to use (defaults to `1`)
+- Remaining model and environment hyperparameters are unchanged from the previous configuration
+
+These options make it easy to add new TrackML partitions—just drop a new `part_*` directory under the base path and restart training.
 
 ## Features
 

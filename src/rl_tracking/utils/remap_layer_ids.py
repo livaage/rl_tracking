@@ -1,4 +1,8 @@
+from pathlib import Path
 import pandas as pd
+
+GEOMETRY_DIR = Path(__file__).resolve().parent.parent / "geometry"
+
 
 def make_remapping_csv(hits_df):
     #volume_order = [8, 7, 9, 13, 12, 14, 16, 17, 18]
@@ -14,9 +18,12 @@ def make_remapping_csv(hits_df):
         for layer in layers:
             remapping.append([vol, layer, layer_counter])
             layer_counter += 1
-    remapping = pd.DataFrame(remapping, columns = ['volume_id', 'layer_id', 'unique_layer_id'])
-    remapping.to_csv('tml_layer_remap.csv')
+    remapping = pd.DataFrame(remapping, columns=['volume_id', 'layer_id', 'unique_layer_id'])
+    output_path = GEOMETRY_DIR / 'tml_layer_remap.csv'
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    remapping.to_csv(output_path, index=False)
     return
+
 
 if __name__ == "__main__":
     hits_df = pd.read_csv('/Users/liv/trackML/train_1/event000002059-hits.csv')

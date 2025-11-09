@@ -39,27 +39,41 @@ class ReplayBuffer(object):
         states, actions, next_states, rewards, dones, hit_features, next_hit_features, hit_masks, next_hit_masks = zip(*experiences)
         
         # Ensure all states have consistent shape - convert to numpy arrays and ensure same shape
-        # States should be 1D arrays of shape (4,) based on observation space
+        # Determine state dimensionality from available samples
+        state_dim = None
+        for candidate in list(states) + list(next_states):
+            if candidate is not None:
+                state_dim = len(np.asarray(candidate, dtype=np.float32).flatten())
+                break
+        if state_dim is None:
+            state_dim = 4  # Fallback if all states are None
+
         states_list = []
         next_states_list = []
+
         for state, next_state in zip(states, next_states):
-            # Handle None states by creating zero array
+            # Handle current state
             if state is None:
-                state = np.zeros(4, dtype=np.float32)
+                state_arr = np.zeros(state_dim, dtype=np.float32)
             else:
-                state = np.asarray(state, dtype=np.float32).flatten()
-                if state.shape != (4,):
-                    state = np.pad(state, (0, max(0, 4 - len(state))), mode='constant')[:4]
-            
+                state_arr = np.asarray(state, dtype=np.float32).flatten()
+                if len(state_arr) < state_dim:
+                    state_arr = np.pad(state_arr, (0, state_dim - len(state_arr)), mode='constant')
+                elif len(state_arr) > state_dim:
+                    state_arr = state_arr[:state_dim]
+
+            # Handle next state
             if next_state is None:
-                next_state = np.zeros(4, dtype=np.float32)
+                next_state_arr = np.zeros(state_dim, dtype=np.float32)
             else:
-                next_state = np.asarray(next_state, dtype=np.float32).flatten()
-                if next_state.shape != (4,):
-                    next_state = np.pad(next_state, (0, max(0, 4 - len(next_state))), mode='constant')[:4]
-            
-            states_list.append(state)
-            next_states_list.append(next_state)
+                next_state_arr = np.asarray(next_state, dtype=np.float32).flatten()
+                if len(next_state_arr) < state_dim:
+                    next_state_arr = np.pad(next_state_arr, (0, state_dim - len(next_state_arr)), mode='constant')
+                elif len(next_state_arr) > state_dim:
+                    next_state_arr = next_state_arr[:state_dim]
+
+            states_list.append(state_arr)
+            next_states_list.append(next_state_arr)
         
         # Process hit_features: ensure they're numpy arrays
         hit_features_list = []

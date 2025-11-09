@@ -13,6 +13,9 @@ from rl_tracking.lightning_modules.multiagent_dqn import MultiAgentDQNLightning
 from rl_tracking.preprocessing.hit_candidates import EventProcessor
 from rl_tracking.utils.stream_loading import TrackingDataModule
 from rl_tracking.utils.config_loader import load_config
+from rl_tracking.utils.data_paths import resolve_data_directories
+
+DEFAULT_TRACKML_DIR = Path("/scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data/part_1")
 
 
 def main(config_path: str | Path):
@@ -21,28 +24,40 @@ def main(config_path: str | Path):
     Args:
         config_path: Path to the YAML configuration file
     """
+    # Resolve configuration path relative to common search locations
+    config_path = _resolve_config_path(config_path)
+
     # Load configuration
     config = load_config(config_path)
     
     # Extract data configuration
     data_config = config.get('data', {})
-    data_dir = Path(data_config.get('data_dir', '/Users/liv/trackML/train_1/'))
+    base_dir, data_directories = resolve_data_directories(
+        data_config,
+        default_dir=DEFAULT_TRACKML_DIR,
+    )
     batch_size = data_config.get('batch_size', 32)
     val_split = data_config.get('val_split', 0.2)
     test_split = data_config.get('test_split', 0.1)
     num_workers = data_config.get('num_workers', 0)
+    random_seed = data_config.get('random_seed', 42)
     event_processor_config = data_config.get('event_processor', {})
     n_neighbors = event_processor_config.get('n_neighbors', 20)
     
+    print(f"Using TrackML data directories:")
+    for directory in data_directories:
+        print(f"  - {directory}")
+    
     # Initialize dataset and dataloader
-    ep = EventProcessor(data_dir, n_neighbors)
+    ep = EventProcessor(base_dir, n_neighbors)
     dm = TrackingDataModule(
-        file_paths=data_dir,
+        file_paths=data_directories,
         batch_size=batch_size,
         event_processor=ep,
         num_workers=num_workers,
         val_split=val_split,
-        test_split=test_split
+        test_split=test_split,
+        random_seed=random_seed,
     )
     
     dm.setup(stage="fit")
@@ -142,25 +157,107 @@ def main(config_path: str | Path):
         verbose=True,
     )
     
+    wandb_offline = wandb_config.get('offline', True)
+    wandb_log_model = wandb_config.get('log_model', True)
+    if wandb_offline and wandb_log_model:
+        print("WandB offline mode enabled; disabling model artifact uploads.")
+        wandb_log_model = False
+
     wandb_logger = WandbLogger(
         project=wandb_project,
         name=wandb_name,
-        log_model=wandb_config.get('log_model', True),
+        log_model=wandb_log_model,
+        offline=wandb_offline,
     )
     
     # Initialize trainer
-    trainer = Trainer(
-        max_epochs=trainer_config.get('max_epochs', 5000),
-        callbacks=[checkpoint_callback, early_stopping_callback],
-        accelerator=trainer_config.get('accelerator', 'auto'),
-        log_every_n_steps=trainer_config.get('log_every_n_steps', 10),
-        gradient_clip_val=trainer_config.get('gradient_clip_val', None),
-        logger=wandb_logger,
-        check_val_every_n_epoch=early_stopping_config.get('check_val_every_n_epoch', 1),
-    )
+    trainer_kwargs = {
+        "max_epochs": trainer_config.get('max_epochs', 5000),
+        "callbacks": [checkpoint_callback, early_stopping_callback],
+        "accelerator": trainer_config.get('accelerator', 'gpu'),
+        "log_every_n_steps": trainer_config.get('log_every_n_steps', 10),
+        "gradient_clip_val": trainer_config.get('gradient_clip_val', None),
+        "logger": wandb_logger,
+        "check_val_every_n_epoch": early_stopping_config.get('check_val_every_n_epoch', 1),
+    }
+
+    devices = trainer_config.get('devices')
+    if devices is None and trainer_kwargs["accelerator"] in {'gpu', 'cuda'}:
+        devices = 1
+    if devices is not None:
+        trainer_kwargs["devices"] = devices
+
+    precision = trainer_config.get('precision')
+    if precision is not None:
+        trainer_kwargs["precision"] = precision
+
+    strategy = trainer_config.get('strategy')
+    if strategy is not None:
+        trainer_kwargs["strategy"] = strategy
+
+    trainer = Trainer(**trainer_kwargs)
     
     # Train the model
     trainer.fit(model)
+    
+    _print_split_summary(dm.get_split_summary())
+
+
+def _print_split_summary(summary: dict) -> None:
+    """Print number of events drawn from each dataset part for every split."""
+    if not summary:
+        return
+    print(f"\n{'='*60}")
+    print("DATASET SPLIT SUMMARY")
+    print(f"{'='*60}")
+    for split_name in ['train', 'val', 'test']:
+        counts = summary.get(split_name, {})
+        total = sum(counts.values())
+        print(f"\n{split_name.upper()} ({total} events)")
+        if not counts:
+            print("  (no events)")
+            continue
+        for part, count in sorted(counts.items()):
+            print(f"  {part}: {count}")
+    print(f"{'='*60}\n")
+
+
+def _resolve_config_path(config_path: str | Path) -> Path:
+    """
+    Resolve a configuration path, supporting execution from arbitrary working directories.
+
+    Args:
+        config_path: User-provided config path (absolute or relative).
+
+    Returns:
+        Resolved Path object pointing to an existing file.
+
+    Raises:
+        FileNotFoundError: If the configuration file cannot be located.
+    """
+    path = Path(config_path).expanduser()
+
+    search_candidates = []
+
+    if path.is_absolute():
+        search_candidates.append(path)
+    else:
+        # Working directory
+        search_candidates.append((Path.cwd() / path).resolve())
+
+        # Relative to training script directory and its parent (project src root)
+        script_dir = Path(__file__).resolve().parent
+        search_candidates.append((script_dir / path).resolve())
+        search_candidates.append((script_dir.parent / path).resolve())
+
+    for candidate in search_candidates:
+        if candidate.exists():
+            return candidate
+
+    searched = ", ".join(str(candidate) for candidate in search_candidates)
+    raise FileNotFoundError(
+        f"Config file not found: {config_path}. Locations checked: {searched}"
+    )
 
 
 if __name__ == "__main__":

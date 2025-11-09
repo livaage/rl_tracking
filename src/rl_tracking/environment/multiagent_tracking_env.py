@@ -4,8 +4,11 @@ This environment manages multiple agents that propagate nearby tracks in lockste
 sharing a compatible hit pool. This helps with hit assignment when multiple tracks
 have overlapping candidate hits.
 """
+from collections import Counter
+
 import numpy as np
 import pandas as pd
+import torch
 from gymnasium.spaces import Box, Discrete
 from rl_tracking.physics.track import Helix
 from rl_tracking.physics.hit_holder import HitHolder
@@ -13,10 +16,12 @@ from rl_tracking.utils.logger import get_logger
 
 logger = get_logger()
 
-COLS = ['hit_id', 'x', 'y', 'z', 'volume_id', 'layer_id', 'module_id',
-       'particle_id', 'tx', 'ty', 'tz', 'tpx', 'tpy', 'tpz', 'weight', 'vx',
-       'vy', 'vz', 'px', 'py', 'pz', 'q', 'nhits', 'r', 'pt',
-        'unique_layer_id', 'phi', 'theta']
+COLS = [
+    'hit_id', 'x', 'y', 'z', 'volume_id', 'layer_id', 'module_id',
+    'particle_id', 'tx', 'ty', 'tz', 'tpx', 'tpy', 'tpz', 'weight', 'particle_type',
+    'vx', 'vy', 'vz', 'px', 'py', 'pz', 'q', 'nhits', 'r', 'pt',
+    'unique_layer_id', 'theta', 'phi'
+]
 
 
 class MultiAgentTrackingEnv:
@@ -90,6 +95,8 @@ class MultiAgentTrackingEnv:
         # Accuracy tracking per agent
         self.total_selections = [0] * num_agents
         self.correct_selections = [0] * num_agents
+        self.rank_selection_counts = [Counter() for _ in range(num_agents)]
+        self.rank_correct_counts = [Counter() for _ in range(num_agents)]
         
         # Coordination metrics
         self.hit_overlap_count = 0  # Times agents had overlapping candidate hits
@@ -251,9 +258,22 @@ class MultiAgentTrackingEnv:
         """Load the next file and compute the number of steps from the column."""
         try:
             data = next(self.data_loader)
-            hits = pd.DataFrame(
-                data.view(data.shape[1], data.shape[2]),
-                columns=COLS)
+            if isinstance(data, (list, tuple)):
+                # IterableDataset may yield (hits, label); use the hits component
+                data = data[0]
+            if isinstance(data, torch.Tensor):
+                np_data = data.squeeze(0).detach().cpu().numpy()
+            elif isinstance(data, np.ndarray):
+                np_data = data.squeeze(0)
+            else:
+                raise TypeError(f"Unsupported data type from loader: {type(data)}")
+
+            if np_data.ndim != 2 or np_data.shape[1] != len(COLS):
+                raise ValueError(
+                    f"Expected event array shape (N, {len(COLS)}), got {np_data.shape}"
+                )
+
+            hits = pd.DataFrame(np_data, columns=COLS)
             
             logger.info(f"Loaded event with {len(hits)} raw hits")
             self.all_hits = hits
@@ -564,6 +584,9 @@ class MultiAgentTrackingEnv:
                         self.total_selections[agent_idx] += 1
                         if is_correct:
                             self.correct_selections[agent_idx] += 1
+                        self.rank_selection_counts[agent_idx][action_idx] += 1
+                        if is_correct:
+                            self.rank_correct_counts[agent_idx][action_idx] += 1
             
             rewards.append(reward)
             
@@ -626,6 +649,24 @@ class MultiAgentTrackingEnv:
         else:
             metrics['conflict_rate'] = 0.0
         
+        return metrics
+
+    def get_rank_selection_metrics(self):
+        """
+        Get per-agent selection statistics keyed by candidate rank.
+        """
+        metrics = []
+        for agent_idx in range(self.num_agents):
+            agent_metrics = {}
+            for rank, total in self.rank_selection_counts[agent_idx].items():
+                correct = self.rank_correct_counts[agent_idx].get(rank, 0)
+                accuracy = correct / total if total else 0.0
+                agent_metrics[int(rank)] = {
+                    "total": total,
+                    "correct": correct,
+                    "accuracy": accuracy,
+                }
+            metrics.append(agent_metrics)
         return metrics
     
     def reset_coordination_metrics(self):

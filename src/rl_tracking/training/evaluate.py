@@ -12,12 +12,14 @@ from rl_tracking.lightning_modules.dqn import DQNLightning
 from rl_tracking.preprocessing.hit_candidates import EventProcessor
 from rl_tracking.utils.stream_loading import TrackingDataModule
 from rl_tracking.utils.config_loader import load_config
+from rl_tracking.utils.data_paths import resolve_data_directories
 from rl_tracking.environment.tracking_env import TrackingEnv
 from rl_tracking.environment.agent import Agent
 from rl_tracking.replay.buffer import ReplayBuffer
 from rl_tracking.physics.hit_holder import HitHolder
 import pandas as pd
 
+DEFAULT_TRACKML_DIR = Path("/scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data/part_1")
 
 def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str = None):
     """Evaluate a trained model on the test set track-by-track.
@@ -56,28 +58,37 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     
     # Extract data configuration
     data_config = config.get('data', {})
-    if test_data_dir is None:
-        test_data_dir = data_config.get('data_dir', '/Users/liv/trackML/train_1/')
-    
-    # Convert test_data_dir to Path if it's a string
-    test_data_dir = Path(test_data_dir)
+    data_config_override = dict(data_config) if data_config else {}
+    if test_data_dir is not None:
+        data_config_override['data_dir'] = test_data_dir
+
+    base_dir, test_data_directories = resolve_data_directories(
+        data_config_override,
+        default_dir=DEFAULT_TRACKML_DIR,
+    )
+
+    print(f"Using TrackML data directories for evaluation:")
+    for directory in test_data_directories:
+        print(f"  - {directory}")
     
     batch_size = data_config.get('batch_size', 32)
     val_split = data_config.get('val_split', 0.2)
     test_split = data_config.get('test_split', 0.1)
     num_workers = data_config.get('num_workers', 0)
+    random_seed = data_config.get('random_seed', 42)
     event_processor_config = data_config.get('event_processor', {})
     n_neighbors = event_processor_config.get('n_neighbors', 20)
     
     # Initialize dataset
-    ep = EventProcessor(test_data_dir, n_neighbors)
+    ep = EventProcessor(base_dir, n_neighbors)
     dm = TrackingDataModule(
-        file_paths=test_data_dir,
+        file_paths=test_data_directories,
         batch_size=batch_size,
         event_processor=ep,
         num_workers=num_workers,
         val_split=val_split,
-        test_split=test_split
+        test_split=test_split,
+        random_seed=random_seed,
     )
     
     # Extract model and environment configuration
@@ -239,6 +250,10 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         use_truth_path_plan=use_truth_path_plan,
         deterministic=True  # CRITICAL: Use deterministic ordering for evaluation reproducibility
     )
+    if hasattr(test_env, "rank_selection_counts"):
+        test_env.rank_selection_counts.clear()
+    if hasattr(test_env, "rank_correct_counts"):
+        test_env.rank_correct_counts.clear()
     
     # Create test agent (no replay buffer needed for evaluation)
     test_buffer = ReplayBuffer(100)  # Small buffer, not used
@@ -823,6 +838,10 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     for r in track_results:
         reason = r.get('termination_reason', 'unknown')
         termination_reasons[reason] = termination_reasons.get(reason, 0) + 1
+
+    rank_metrics = {}
+    if hasattr(test_env, "get_rank_selection_metrics"):
+        rank_metrics = test_env.get_rank_selection_metrics()
     
     # Print results
     print(f"\n{'='*60}")
@@ -855,6 +874,15 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     print(f"\nTermination Reasons:")
     for reason, count in termination_reasons.items():
         print(f"  {reason}: {count} ({count/total_tracks*100:.1f}%)")
+    if rank_metrics:
+        print(f"\nRank Selection Metrics:")
+        for rank in sorted(rank_metrics):
+            stats = rank_metrics[rank]
+            total = stats.get("total", 0)
+            correct = stats.get("correct", 0)
+            accuracy = stats.get("accuracy", 0.0)
+            if total > 0:
+                print(f"  Rank {rank}: accuracy={accuracy:.4f} ({int(correct)}/{int(total)})")
     print(f"\nPerformance Metrics:")
     print(f"  Average Track Reward: {avg_track_reward:.4f}")
     print(f"  Average Track Steps: {avg_track_steps:.2f}")
@@ -1010,7 +1038,9 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         f.write("="*60 + "\n")
         f.write(f"Model: {model_path}\n")
         f.write(f"Config: {config_path}\n")
-        f.write(f"Test Data: {test_data_dir}\n")
+        f.write("Test Data directories:\n")
+        for directory in test_data_directories:
+            f.write(f"  - {directory}\n")
         f.write(f"Particle Filters: {particle_filters}\n")
         f.write(f"Hit Filters: {hit_filters}\n")
         f.write(f"\nMetrics (seed hits excluded from efficiency):\n")
@@ -1025,6 +1055,17 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         f.write(f"  Mean Purity: {np.mean(purities):.4f} ± {np.std(purities):.4f}\n")
         f.write(f"  Average Track Time: {avg_track_time*1000:.2f} ms\n")
         f.write(f"  Tracks per Second: {total_tracks/total_time:.2f}\n" if total_time > 0 else "  Tracks per Second: N/A\n")
+        if rank_metrics:
+            f.write("\nRank Selection Metrics:\n")
+            for rank in sorted(rank_metrics):
+                stats = rank_metrics[rank]
+                total = stats.get("total", 0)
+                correct = stats.get("correct", 0)
+                accuracy = stats.get("accuracy", 0.0)
+                if total > 0:
+                    f.write(
+                        f"  Rank {rank}: accuracy={accuracy:.4f} ({int(correct)}/{int(total)})\n"
+                    )
     
     print(f"Results saved to {results_file}")
     print(f"Plots saved to {plot_dir}")
@@ -1055,7 +1096,7 @@ if __name__ == "__main__":
         '--test_data_dir',
         type=str,
         default=None,
-        help='Optional path to test data directory (if different from config)'
+        help='Optional path to test data directory (overrides config; can point to a specific part directory)'
     )
     args = parser.parse_args()
     

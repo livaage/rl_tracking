@@ -4,6 +4,10 @@ version = "0.1.0"
 description = ""
 authors = ["liv <liv.helen.vage@cern.ch>"]
 readme = "README.md"
+packages = [
+    { include = "rl_tracking", from = "src" },
+    { include = "track_propagation", from = "src" },
+]
 
 [tool.poetry.dependencies]
 python = "^3.12"
