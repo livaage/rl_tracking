@@ -29,25 +29,25 @@ class RLDataset(IterableDataset):
         batch = self.buffer.sample(sample_count)
         # Handle both old format (5 items) and new format (9 items with hit_features)
         if len(batch) == 5:
-            states, actions, rewards, dones, new_states = batch
+            states, actions, next_states, rewards, dones = batch
             for i in range(len(dones)):
                 state = np.asarray(states[i], dtype=np.float32)
                 action = np.asarray(actions[i], dtype=np.int64)
+                next_state = np.asarray(next_states[i], dtype=np.float32)
                 reward = np.asarray(rewards[i], dtype=np.float32)
                 done = np.asarray(dones[i], dtype=bool)
-                new_state = np.asarray(new_states[i], dtype=np.float32)
-                yield state, action, reward, done, new_state
+                yield state, action, reward, done, next_state
         else:
             # New format with hit_features
-            states, actions, rewards, dones, new_states, hit_features, next_hit_features, hit_masks, next_hit_masks = batch
+            states, actions, next_states, rewards, dones, hit_features, next_hit_features, hit_masks, next_hit_masks = batch
             for i in range(len(dones)):
                 state = np.asarray(states[i], dtype=np.float32)
                 action = np.asarray(actions[i], dtype=np.int64)
+                next_state = np.asarray(next_states[i], dtype=np.float32)
                 reward = np.asarray(rewards[i], dtype=np.float32)
                 done = np.asarray(dones[i], dtype=bool)
-                new_state = np.asarray(new_states[i], dtype=np.float32)
                 hit_feat = np.asarray(hit_features[i], dtype=np.float32)
                 next_hit_feat = np.asarray(next_hit_features[i], dtype=np.float32)
                 hit_mask = np.asarray(hit_masks[i], dtype=bool)
                 next_hit_mask = np.asarray(next_hit_masks[i], dtype=bool)
-                yield state, action, reward, done, new_state, hit_feat, next_hit_feat, hit_mask, next_hit_mask
+                yield state, action, reward, done, next_state, hit_feat, next_hit_feat, hit_mask, next_hit_mask

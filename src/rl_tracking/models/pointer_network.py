@@ -37,13 +37,7 @@ class PointerNetwork(nn.Module):
         )
         
         # Hit encoder: encodes each candidate hit's features
-        self.hit_encoder = nn.Sequential(
-            nn.Linear(hit_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),  # Key vector
-        )
+        self.hit_encoder = self._build_hit_encoder(hit_dim)
         
         # Compatibility scorer: computes score between state and hit
         # Uses dot product attention
@@ -64,8 +58,22 @@ class PointerNetwork(nn.Module):
         
         # Scale final layer even smaller to match reward scale
         if hasattr(self, 'score_projection'):
-            # Don't use score_projection for now, but if we do, initialize it small
             pass
+
+    def _build_hit_encoder(self, hit_dim: int) -> nn.Sequential:
+        encoder = nn.Sequential(
+            nn.Linear(hit_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        for module in encoder.modules():
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    torch.nn.init.constant_(module.bias, 0.0)
+        return encoder
     
     def forward(self, state, hit_features, mask=None):
         """
@@ -105,6 +113,13 @@ class PointerNetwork(nn.Module):
                 elif mask.dim() == 1:
                     mask = mask[:max_expected_hits]
         
+        if state.shape[-1] != self.state_dim:
+            print(
+                f"[PointerNetwork] state dim mismatch: expected {self.state_dim}, got {state.shape[-1]}"
+            )
+            print(f"  state tensor shape: {state.shape}")
+            raise RuntimeError("State dimension mismatch")
+
         # Encode state to query vector: [batch_size, hidden_dim]
         state_query = self.state_encoder(state)  # [batch_size, hidden_dim]
         
@@ -113,6 +128,14 @@ class PointerNetwork(nn.Module):
             state_query = torch.where(torch.isnan(state_query) | torch.isinf(state_query),
                                      torch.zeros_like(state_query), state_query)
         
+        if hit_features.shape[-1] != self.hit_dim:
+            print(
+                f"[PointerNetwork] rebuilding hit encoder: prev hit_dim={self.hit_dim}, new hit_dim={hit_features.shape[-1]}"
+            )
+            self.hit_dim = hit_features.shape[-1]
+            new_encoder = self._build_hit_encoder(self.hit_dim).to(hit_features.device)
+            self.hit_encoder = new_encoder
+
         # Encode hit features to key vectors: [batch_size, num_hits, hidden_dim]
         hit_keys = self.hit_encoder(hit_features.view(-1, self.hit_dim))  # [batch_size * num_hits, hidden_dim]
         hit_keys = hit_keys.view(batch_size, num_hits, self.hidden_dim)  # [batch_size, num_hits, hidden_dim]

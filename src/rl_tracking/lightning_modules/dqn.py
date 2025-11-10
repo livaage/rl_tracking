@@ -1,21 +1,20 @@
 from pytorch_lightning import LightningModule
-from rl_tracking.models.mlp import DQN
 from rl_tracking.models.pointer_network import PointerNetwork
 from rl_tracking.environment.agent import Agent
 from rl_tracking.environment.tracking_env import TrackingEnv
 from rl_tracking.replay.buffer import ReplayBuffer
 from torch import Tensor, nn
 from typing import Tuple, List
-from collections import OrderedDict, Counter
+from collections import OrderedDict
 import torch
-import pandas as pd
 import numpy as np
 from torch.utils.data import DataLoader
-from rl_tracking.utils.stream_loading import RLKernelIterableDataset
 from torch.optim import Adam, Optimizer
 import torch.optim
+from rl_tracking.utils.logger import get_logger
 from rl_tracking.utils.experience_loader import RLDataset
-import numpy as np
+
+logger = get_logger()
 
 class DQNLightning(LightningModule):
     def __init__(
@@ -74,21 +73,24 @@ class DQNLightning(LightningModule):
             pin_memory=False,
             drop_last=False
         )
+        hit_feature_mode = environment_config.get('hit_feature_mode', 'absolute')
+        state_feature_mode = environment_config.get('state_feature_mode', 'full')
+        
         self.env = TrackingEnv(
             env_dataloader, 
             particle_filters=particle_filters, 
             hit_filters=hit_filters,
             use_distance_reward=use_distance_reward,
-            use_truth_path_plan=use_truth_path_plan
+            deterministic=False,
+            hit_feature_mode=hit_feature_mode,
+            state_feature_mode=state_feature_mode,
         )
-        # Get observation size - handle both tuple and int shapes
-        obs_shape = self.env.observation_space.shape
-        obs_size = obs_shape[0] if len(obs_shape) > 0 else obs_shape
-        
+        setattr(self.env, "context_tag", "train")
+
         # Use PointerNetwork instead of DQN for feature-based hit selection
-        # State dim: helix position [z, r, x, y] = 4
+        # State dim comes from enriched observation (track context features)
         # Hit dim: hit features [x, y, z, r] = 4
-        state_dim = 4
+        state_dim = self.env.observation_space.shape[0]
         hit_dim = 4
         hidden_dim = 256
         
@@ -113,8 +115,11 @@ class DQNLightning(LightningModule):
             particle_filters=particle_filters,
             hit_filters=hit_filters,
             use_distance_reward=use_distance_reward,
-            use_truth_path_plan=use_truth_path_plan
+            deterministic=True,
+            hit_feature_mode=hit_feature_mode,
+            state_feature_mode=state_feature_mode,
         )
+        setattr(self.val_env, "context_tag", "val")
         self.val_agent = Agent(self.val_env, self.val_buffer)
         
         self.agent = Agent(self.env, self.buffer)
@@ -122,7 +127,7 @@ class DQNLightning(LightningModule):
         # CRITICAL SAFEGUARD: Verify that test_dataset is NOT being used during training
         # The test dataset should only be used in evaluate.py for final evaluation
         # Note: This check is performed in stream_loading.py during setup(),
-        # but we add a reminder here that test_dataset exists but should not be used
+        # but we add a reminder here that test_dataset exists but should not be accessed
         if hasattr(dm, 'test_dataset'):
             # The overlap check is already done in stream_loading.py setup()
             # This is just a reminder that test_dataset exists but should never be accessed
@@ -131,13 +136,6 @@ class DQNLightning(LightningModule):
         self.total_reward = 0
         self.episode_reward = 0
         self.val_episode_reward = 0
-        
-        # Track episode completion statistics
-        self.episode_termination_reasons = []  # Track why episodes end
-        self.episode_completion_ratios = []  # Track completion ratio (hit_number / track_length)
-        self.episode_expected_hits = []  # Expected hits per episode
-        self.episode_predicted_hits = []  # Predicted hits per episode
-        self.episode_correct_hits = []  # Correct hits per episode
         self.populate(self.hparams.warm_start_steps)
         # Populate validation buffer with enough samples (at least batch_size * 2 to ensure batching works)
         self._populate_val_buffer(max(100, self.hparams.batch_size * 2))
@@ -199,31 +197,13 @@ class DQNLightning(LightningModule):
         
         # Ensure rewards is 1D with shape (batch_size,)
         # Flatten any extra dimensions and ensure correct shape
-        original_rewards_shape = rewards.shape
-        rewards = rewards.flatten()
-        
-        # If rewards is smaller than batch_size, something is wrong
-        if rewards.shape[0] != batch_size:
-            raise ValueError(
-                f"Rewards batch size {rewards.shape[0]} doesn't match states batch size {batch_size}. "
-                f"Rewards shape: {original_rewards_shape} -> {rewards.shape}, States shape: {states.shape}, "
-                f"Actions shape: {actions.shape}, Dones shape: {dones.shape}, Next states shape: {next_states.shape}"
-            )
-        
-        # Ensure rewards is exactly 1D (batch_size,)
-        rewards = rewards.squeeze() if rewards.dim() > 1 else rewards
-        if rewards.dim() > 1:
-            raise ValueError(f"Rewards should be 1D but has shape {rewards.shape}")
-        
+        rewards = rewards.view(batch_size, -1)[:, 0].float()
+
         # Ensure actions is 1D
-        actions = actions.flatten()
-        if actions.shape[0] != batch_size:
-            raise ValueError(f"Actions batch size {actions.shape[0]} doesn't match states batch size {batch_size}")
-        
+        actions = actions.view(batch_size, -1)[:, 0].long()
+
         # Ensure dones is 1D
-        dones = dones.flatten()
-        if dones.shape[0] != batch_size:
-            raise ValueError(f"Dones batch size {dones.shape[0]} doesn't match states batch size {batch_size}")
+        dones = dones.view(batch_size, -1)[:, 0].bool()
         
         # Get scores for current states and hit features using pointer network
         if hit_features is not None:
@@ -517,510 +497,234 @@ class DQNLightning(LightningModule):
             return end
         return start - (self.global_step / frames) * (start - end)
 
-    def training_step(self, batch: Tuple[Tensor, Tensor], nb_batch) -> OrderedDict:
-        """Carries out a single step through the environment to update the replay buffer. Then calculates loss based on
-        the minibatch received.
+    def training_step(self, batch: Tuple[Tensor, Tensor], nb_batch) -> Tensor:
+        """Advance the environment, update replay buffer, and compute loss."""
 
-        Args:
-            batch: current mini batch of replay data
-            nb_batch: batch number
-
-        Returns:
-            Training loss and log metrics
-
-        """
         device = self.get_device(batch)
-        epsilon = self.get_epsilon(self.hparams.eps_start, self.hparams.eps_end, self.hparams.eps_last_frame)
+        epsilon = self.get_epsilon(
+            self.hparams.eps_start,
+            self.hparams.eps_end,
+            self.hparams.eps_last_frame,
+        )
         self.log("epsilon", epsilon)
 
-        # step through environment with agent
         reward, done = self.agent.play_step(self.net, epsilon, device)
         self.episode_reward += reward
-        
-        # Track accuracy and completion statistics from environment
+
         env = self.agent.env
-        if hasattr(env, 'total_selections') and env.total_selections > 0:
-            accuracy = env.correct_selections / env.total_selections
+        if getattr(env, "total_selections", 0) > 0:
+            accuracy = env.correct_selections / max(env.total_selections, 1e-9)
             self.log("hit_accuracy", accuracy, prog_bar=True)
-            
-            # Track accuracy separately by exploration level to distinguish learning from exploration reduction
-            # This helps identify if accuracy improves due to less exploration vs actual learning
-            if epsilon > 0.5:
-                self.log("hit_accuracy_high_exploration", accuracy)
-            elif epsilon > 0.1:
-                self.log("hit_accuracy_medium_exploration", accuracy)
-            else:
-                self.log("hit_accuracy_low_exploration", accuracy)
-        
-        # Track episode completion and termination reasons
-        if done:
-            # Get termination info stored by agent before reset
-            termination_info = getattr(env, '_last_termination_info', None)
-            if termination_info:
-                termination_reason = termination_info['reason']
-                current_hit_number = termination_info.get('hit_number', 0)
-                track_length = termination_info.get('track_length', 0)
-            else:
-                # Fallback: try to get from current state (may be reset already)
-                current_hit_number = getattr(env, 'hit_number', 0)
-                track_length = len(env.current_track) if hasattr(env, 'current_track') and env.current_track is not None else 0
-                if track_length > 0 and current_hit_number >= track_length:
-                    termination_reason = 'completed_all_hits'
-                elif track_length > 0 and current_hit_number < track_length:
-                    termination_reason = 'no_compatible_hits'
-                else:
-                    termination_reason = 'unknown'
-            
-            # Get expected hits (excluding seed hits) from termination_info (captured before reset)
-            # IMPORTANT: termination_info now calculates expected_hits based on path_plan layers only
-            if termination_info and 'expected_hits' in termination_info:
-                expected_hits = termination_info['expected_hits']
-            else:
-                # Fallback: try to get from current state (may have been reset)
-                expected_hits = 0
-                current_track = getattr(env, 'current_track', None)
-                if current_track is not None and len(current_track) > 0:
-                    seed_hit_ids = set()
-                    if hasattr(env, 'helix') and env.helix is not None:
-                        if hasattr(env.helix, 'seed_hits') and env.helix.seed_hits is not None:
-                            seed_df = env.helix.seed_hits
-                            if isinstance(seed_df, pd.DataFrame):
-                                if 'hit_id' in seed_df.columns:
-                                    seed_hit_ids = set(seed_df['hit_id'].values.astype(int))
-                        
-                        # Only count hits from layers in the path_plan that come AFTER the seed
-                        # Use initial_start_layer (the final seed layer) not current_layer (which has advanced)
-                        if hasattr(env.helix, 'path_plan') and env.helix.path_plan is not None:
-                            # Get initial starting layer (final seed layer) - this doesn't change as we progress
-                            initial_start_layer = getattr(env.helix, 'initial_start_layer', None)
-                            if initial_start_layer is None:
-                                # Fallback: try to get from seed_hits (last seed layer)
-                                if hasattr(env.helix, 'seed_hits') and env.helix.seed_hits is not None:
-                                    seed_df = env.helix.seed_hits
-                                    if isinstance(seed_df, pd.DataFrame) and 'unique_layer_id' in seed_df.columns:
-                                        seed_layers = seed_df['unique_layer_id'].values
-                                        initial_start_layer = float(max(seed_layers)) if len(seed_layers) > 0 else None
-                            
-                            # Filter path_plan to only include post-seed layers
-                            # Convert to list and handle numpy types properly
-                            all_path_layers = [float(layer) for layer in env.helix.path_plan]
-                            if initial_start_layer is not None:
-                                initial_start_layer_float = float(initial_start_layer)
-                                path_plan_layers = [layer for layer in all_path_layers if float(layer) > initial_start_layer_float]
-                            else:
-                                # Fallback: exclude seed layers by ID
-                                path_plan_layers = [layer for layer in all_path_layers if layer not in seed_hit_ids]
-                            path_plan_layers_set = set(path_plan_layers)
-                            track_hits_in_path = current_track[
-                                current_track['unique_layer_id'].isin(path_plan_layers_set)
-                            ]
-                            correct_hit_ids = set(track_hits_in_path['hit_id'].values)
-                        else:
-                            correct_hit_ids = set(current_track['hit_id'].values)
-                    else:
-                        correct_hit_ids = set(current_track['hit_id'].values)
-                    
-                    expected_hits = len(correct_hit_ids) - len(seed_hit_ids)
-                    if expected_hits < 0:
-                        expected_hits = 0
-            
-            # Predicted hits = number of selections made (get from termination_info before reset)
-            # Note: total_selections counts actual hit selections, NOT steps
-            # This is the key metric - how many hits did we actually select?
-            if termination_info and 'total_selections' in termination_info:
-                predicted_hits = termination_info['total_selections']
-            else:
-                # Fallback: try current state (may be reset already)
-                predicted_hits = env.total_selections if hasattr(env, 'total_selections') else 0
-            
-            # Correct hits = number of correct selections made (get from termination_info before reset)
-            if termination_info and 'correct_selections' in termination_info:
-                correct_hits = termination_info['correct_selections']
-            else:
-                # Fallback: try current state (may be reset already)
-                correct_hits = env.correct_selections if hasattr(env, 'correct_selections') else 0
-            
-            # Debug: log relationship between hit_number, selections, and expected hits
-            # KEY INSIGHT: hit_number counts STEPS (increments every step, even if no compatible hits)
-            # total_selections counts SELECTIONS (only increments when we actually select a hit)
-            # If some steps have no compatible hits, hit_number advances but total_selections doesn't
-            # This explains why completion_ratio=1 but efficiency is low!
-            if termination_info:
-                hit_num = termination_info.get('hit_number', 0)
-                selections = termination_info.get('total_selections', 0)
-                # Log metrics to diagnose the mismatch
-                if self.global_step % 100 == 0:  # Log occasionally
-                    self.log("debug_hit_number_vs_selections", hit_num - selections)  # Difference (should be ~0)
-                    self.log("debug_total_selections", selections)  # Actual selections made
-                    if expected_hits > 0:
-                        self.log("debug_selections_vs_expected", selections / expected_hits)  # Efficiency ratio
-                        self.log("debug_hit_number_vs_expected", hit_num / expected_hits)  # Step ratio
-                        # The difference tells us how many steps had no compatible hits
-                        self.log("debug_steps_without_hits", hit_num - selections)
-            
-            # Store statistics
-            self.episode_termination_reasons.append(termination_reason)
-            if track_length > 0:
-                completion_ratio = current_hit_number / track_length
-                self.episode_completion_ratios.append(completion_ratio)
-            self.episode_expected_hits.append(expected_hits)
-            self.episode_predicted_hits.append(predicted_hits)
-            self.episode_correct_hits.append(correct_hits)
-            
-                    # Log statistics periodically (every episode, but only log every 10 steps)
-            if self.global_step % 10 == 0:
-                # Count termination reasons (last 100 episodes)
-                recent_reasons = self.episode_termination_reasons[-100:] if len(self.episode_termination_reasons) > 0 else []
-                if len(recent_reasons) > 0:
-                    term_counts = Counter(recent_reasons)
-                    total_recent = len(recent_reasons)
-                    # Log each reason as a ratio (should sum to ~1.0 across all reasons)
-                    for reason, count in term_counts.items():
-                        ratio = count / total_recent if total_recent > 0 else 0.0
-                        self.log(f"episode_termination_{reason}", ratio)
-                    # Also log total for debugging
-                    self.log("episode_termination_total_episodes", total_recent)
-                    
-                    # Average completion ratio
-                    recent_completions = self.episode_completion_ratios[-100:] if len(self.episode_completion_ratios) > 0 else []
-                    if len(recent_completions) > 0:
-                        avg_completion = np.mean(recent_completions)
-                        self.log("episode_avg_completion_ratio", avg_completion)
-                    
-                    # Average expected vs predicted vs correct hits
-                    recent_expected = self.episode_expected_hits[-100:] if len(self.episode_expected_hits) > 0 else []
-                    recent_predicted = self.episode_predicted_hits[-100:] if len(self.episode_predicted_hits) > 0 else []
-                    recent_correct = self.episode_correct_hits[-100:] if len(self.episode_correct_hits) > 0 else []
-                    if len(recent_expected) > 0 and len(recent_predicted) > 0:
-                        avg_expected = np.mean(recent_expected)
-                        avg_predicted = np.mean(recent_predicted)
-                        avg_correct = np.mean(recent_correct) if len(recent_correct) > 0 else 0
-                        self.log("episode_avg_expected_hits", avg_expected)
-                        self.log("episode_avg_predicted_hits", avg_predicted)
-                        self.log("episode_avg_correct_hits", avg_correct)
-                        if avg_expected > 0:
-                            # Efficiency = correct hits / expected hits (not predicted / expected)
-                            self.log("episode_hit_efficiency_ratio", avg_correct / avg_expected)
-                            # Also log purity = correct hits / predicted hits
-                            if avg_predicted > 0:
-                                self.log("episode_hit_purity_ratio", avg_correct / avg_predicted)
-        
-        # Log reward statistics
+
         self.log("step_reward", reward, prog_bar=False)
         self.log("episode reward", self.episode_reward)
-        
-        # Track reward statistics for diagnostics
-        if not hasattr(self, 'reward_history'):
+
+        if done:
+            stats = getattr(env, "last_episode_stats", None)
+            if stats:
+                expected = float(stats.get("expected_hits", 0.0))
+                predicted = float(stats.get("total_selections", 0.0))
+                correct = float(stats.get("correct_selections", 0.0))
+                reason = stats.get("reason", "unknown")
+                if expected > 0:
+                    self.log("episode_hit_efficiency", correct / max(expected, 1e-9))
+                if predicted > 0:
+                    self.log("episode_hit_purity", correct / max(predicted, 1e-9))
+                self.log("episode_expected_hits", expected)
+                self.log("episode_selected_hits", predicted)
+                self.log("episode_correct_hits", correct)
+                reason_id = {
+                    "finished_track": 0.0,
+                    "no_candidates": 1.0,
+                    "unknown": 2.0,
+                }.get(reason, 2.0)
+                self.log("episode_termination_reason", reason_id)
+            self.total_reward = self.episode_reward
+            self.episode_reward = 0
+
+        if not hasattr(self, "reward_history"):
             self.reward_history = []
         self.reward_history.append(reward)
         if len(self.reward_history) > 1000:
-            self.reward_history = self.reward_history[-1000:]  # Keep last 1000
-        
-        # Log reward statistics periodically
-        if self.global_step % 100 == 0 and len(self.reward_history) > 0:
+            self.reward_history = self.reward_history[-1000:]
+        if self.global_step % 100 == 0 and self.reward_history:
             reward_array = np.array(self.reward_history)
             self.log("reward_mean", float(np.mean(reward_array)))
             self.log("reward_std", float(np.std(reward_array)))
             self.log("reward_min", float(np.min(reward_array)))
             self.log("reward_max", float(np.max(reward_array)))
 
-        # calculates training loss
         loss = self.dqn_mse_loss(batch)
 
-        if done:
-            self.total_reward = self.episode_reward
-            self.episode_reward = 0
-
-        # Soft update of target network using polyak averaging
-        # Using tau=0.05 for faster convergence (was 0.005 which was too slow)
-        # This balances stability with learning speed
-        tau = 0.05  # Soft update coefficient - increased from 0.005
+        tau = 0.05
         if self.global_step % self.hparams.sync_rate == 0:
-            # Option 1: Soft update (polyak averaging) - smoother but slower
-            for target_param, param in zip(self.target_net.parameters(), self.net.parameters()):
-                target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
-            
-            # Option 2: Hard update every sync_rate steps (uncomment to use instead)
-            # This is more aggressive but can be more stable for DQN
-            # self.target_net.load_state_dict(self.net.state_dict())
+            for target_param, param in zip(
+                self.target_net.parameters(), self.net.parameters()
+            ):
+                target_param.data.copy_(
+                    tau * param.data + (1.0 - tau) * target_param.data
+                )
 
-        self.log_dict(
-            {
-                "reward": reward,
-                "train_loss": loss,
-            }
-        )
+        self.log_dict({"reward": reward, "train_loss": loss})
         self.log("total_reward", self.total_reward, prog_bar=True)
         self.log("steps", self.global_step, logger=False, prog_bar=True)
 
         return loss
     
     def validation_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> OrderedDict:
-        """Validation step - runs fresh episodes with epsilon=0 to evaluate current policy.
-        
-        Uses separate validation events (held out from training) to ensure proper evaluation.
-        
-        Args:
-            batch: current mini batch (may be ignored in favor of fresh episodes)
-            batch_idx: batch index
-            
-        Returns:
-            Validation loss and metrics
-        """
+        """Run a handful of greedy validation episodes and log summary metrics."""
+
         device = self.get_device(batch)
-        
-        # Run fresh validation episodes with epsilon=0 (pure exploitation)
-        # This gives us true validation performance on held-out events
-        val_steps = 20  # Run a few episodes for validation
-        
-        val_losses = []
-        val_accuracies = []
-        val_rewards_list = []
-        rank_metrics = {}
-        
+        val_env = self.val_agent.env
+
+        # Ensure validation samples reflect the current policy by clearing stale entries first
+        if hasattr(self.val_buffer, "clear"):
+            self.val_buffer.clear()
+
+        val_rewards: List[float] = []
+        efficiencies: List[float] = []
+        purities: List[float] = []
+        termination_reasons: List[str] = []
+        accuracies: List[float] = []
+
+        num_episodes = 10
+
         with torch.no_grad():
-            # Save current environment state
-            original_env_state = self.agent.env
-            
-            # Use validation agent/environment (separate instance)
-            val_env = self.val_agent.env
-            val_agent = self.val_agent
-            
-            # Reset validation environment counters
-            if hasattr(val_env, 'total_selections'):
-                val_env.total_selections = 0
-                val_env.correct_selections = 0
-            if hasattr(val_env, 'rank_selection_counts'):
-                val_env.rank_selection_counts.clear()
-            if hasattr(val_env, 'rank_correct_counts'):
-                val_env.rank_correct_counts.clear()
-            
-            # Track validation episode statistics
-            val_termination_reasons = []
-            val_completion_ratios = []
-            val_expected_hits_list = []
-            val_predicted_hits_list = []
-            val_correct_hits_list = []
-            
-            # Run validation episodes
-            val_episode_reward = 0
-            for step in range(val_steps):
-                # Run with epsilon=0 (pure exploitation - no exploration)
-                reward, done = val_agent.play_step(self.net, epsilon=0.0, device=device)
-                val_episode_reward += reward
-                
-                if done:
-                    # Calculate episode metrics
-                    if hasattr(val_env, 'total_selections') and val_env.total_selections > 0:
-                        episode_accuracy = val_env.correct_selections / val_env.total_selections
-                        val_accuracies.append(episode_accuracy)
-                    val_rewards_list.append(val_episode_reward)
-                    val_episode_reward = 0
-                    
-                    # Track termination reason and completion
-                    # Get termination info stored by agent before reset
-                    termination_info = getattr(val_env, '_last_termination_info', None)
-                    if termination_info:
-                        term_reason = termination_info['reason']
-                        current_hit_number = termination_info.get('hit_number', 0)
-                        track_length = termination_info.get('track_length', 0)
-                    else:
-                        # Fallback: try to get from current state
-                        current_hit_number = getattr(val_env, 'hit_number', 0)
-                        track_length = len(val_env.current_track) if hasattr(val_env, 'current_track') and val_env.current_track is not None else 0
-                        if track_length > 0 and current_hit_number >= track_length:
-                            term_reason = 'completed_all_hits'
-                        elif track_length > 0 and current_hit_number < track_length:
-                            term_reason = 'no_compatible_hits'
-                        else:
-                            term_reason = 'unknown'
-                    
-                    # Get expected vs predicted vs correct hits
-                    # Use termination_info to get values BEFORE reset
-                    if termination_info:
-                        if 'expected_hits' in termination_info:
-                            expected_hits = termination_info['expected_hits']
-                        else:
-                            expected_hits = 0
-                        if 'total_selections' in termination_info:
-                            predicted_hits = termination_info['total_selections']
-                        else:
-                            predicted_hits = 0
-                        if 'correct_selections' in termination_info:
-                            correct_hits = termination_info['correct_selections']
-                        else:
-                            correct_hits = 0
-                    else:
-                        # Fallback: try current state (may be reset already)
-                        expected_hits = 0
-                        predicted_hits = val_env.total_selections if hasattr(val_env, 'total_selections') else 0
-                        correct_hits = val_env.correct_selections if hasattr(val_env, 'correct_selections') else 0
-                    
-                    # Also try to get from current track if termination_info didn't have it
-                    current_track = getattr(val_env, 'current_track', None)
-                    if expected_hits == 0 and current_track is not None and len(current_track) > 0:
-                        seed_hit_ids = set()
-                        if hasattr(val_env, 'helix') and val_env.helix is not None:
-                            if hasattr(val_env.helix, 'seed_hits') and val_env.helix.seed_hits is not None:
-                                seed_df = val_env.helix.seed_hits
-                                if isinstance(seed_df, pd.DataFrame) and 'hit_id' in seed_df.columns:
-                                    seed_hit_ids = set(seed_df['hit_id'].values.astype(int))
-                            
-                            # Only count hits from layers in the path_plan (not all layers in current_track)
-                            if hasattr(val_env.helix, 'path_plan') and val_env.helix.path_plan is not None:
-                                path_plan_layers = set(val_env.helix.path_plan)
-                                track_hits_in_path = current_track[
-                                    current_track['unique_layer_id'].isin(path_plan_layers)
-                                ]
-                                correct_hit_ids = set(track_hits_in_path['hit_id'].values)
-                            else:
-                                correct_hit_ids = set(current_track['hit_id'].values)
-                        else:
-                            correct_hit_ids = set(current_track['hit_id'].values)
-                        
-                        expected_hits = len(correct_hit_ids) - len(seed_hit_ids)
-                        if expected_hits < 0:
-                            expected_hits = 0
-                    
-                    val_termination_reasons.append(term_reason)
-                    if track_length > 0:
-                        val_completion_ratios.append(current_hit_number / track_length)
-                    val_expected_hits_list.append(expected_hits)
-                    val_predicted_hits_list.append(predicted_hits)
-                    val_correct_hits_list.append(correct_hits)
-                    
-                    # Reset accuracy counters for next episode
-                    if hasattr(val_env, 'total_selections'):
-                        val_env.total_selections = 0
-                        val_env.correct_selections = 0
-            
-            # Also compute loss on validation buffer if it has enough samples
-            if len(self.val_buffer) >= self.hparams.batch_size:
-                try:
-                    val_batch_raw = self.val_buffer.sample(self.hparams.batch_size)
-                    # Convert to tensors using our collate logic
-                    val_states_t = torch.tensor(val_batch_raw[0], dtype=torch.float32).to(device)
-                    val_actions_t = torch.tensor(val_batch_raw[1], dtype=torch.int64).to(device)
-                    val_next_states_t = torch.tensor(val_batch_raw[2], dtype=torch.float32).to(device)
-                    val_rewards_t = torch.tensor(val_batch_raw[3], dtype=torch.float32).to(device)
-                    val_dones_t = torch.tensor(val_batch_raw[4], dtype=torch.bool).to(device)
-                    val_hf_t = torch.tensor(val_batch_raw[5], dtype=torch.float32).to(device)
-                    val_nhf_t = torch.tensor(val_batch_raw[6], dtype=torch.float32).to(device)
-                    val_hm_t = torch.tensor(val_batch_raw[7], dtype=torch.bool).to(device)
-                    val_nhm_t = torch.tensor(val_batch_raw[8], dtype=torch.bool).to(device)
-                    
-                    val_batch = (val_states_t, val_actions_t, val_rewards_t, val_dones_t, val_next_states_t,
-                                val_hf_t, val_nhf_t, val_hm_t, val_nhm_t)
-                    val_loss = self.dqn_mse_loss(val_batch)
-                    val_losses.append(val_loss.item())
-                except Exception as e:
-                    # If buffer sampling fails, skip loss calculation
-                    pass
-        
-        # Log validation metrics
-        if len(val_losses) > 0:
-            avg_val_loss = sum(val_losses) / len(val_losses)
-            self.log("val_loss", avg_val_loss, on_step=False, on_epoch=True, prog_bar=True)
+            for _ in range(num_episodes):
+                self.val_agent.reset()
+                done = False
+                episode_reward = 0.0
+                while not done:
+                    reward, done = self.val_agent.play_step(
+                        self.net, epsilon=0.0, device=device
+                    )
+                    episode_reward += reward
+                val_rewards.append(episode_reward)
+
+                stats = getattr(val_env, "last_episode_stats", None)
+                if not stats:
+                    continue
+
+                expected = float(stats.get("expected_hits", 0.0))
+                predicted = float(stats.get("total_selections", 0.0))
+                correct = float(stats.get("correct_selections", 0.0))
+                reason = stats.get("reason", "unknown")
+
+                if expected > 0:
+                    efficiencies.append(correct / max(expected, 1e-9))
+                if predicted > 0:
+                    purities.append(correct / max(predicted, 1e-9))
+                if predicted > 0:
+                    accuracies.append(correct / max(predicted, 1e-9))
+                termination_reasons.append(reason)
+
+        if val_rewards:
+            self.log(
+                "val_episode_reward",
+                float(np.mean(val_rewards)),
+                on_step=False,
+                on_epoch=True,
+                add_dataloader_idx=False,
+            )
+        if efficiencies:
+            self.log(
+                "val_hit_efficiency",
+                float(np.mean(efficiencies)),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                add_dataloader_idx=False,
+            )
         else:
-            self.log("val_loss", 0.0, on_step=False, on_epoch=True, prog_bar=True)
-        
-        # Log validation accuracy (evaluated with epsilon=0, so this tracks true policy quality)
-        if len(val_accuracies) > 0:
-            avg_val_accuracy = sum(val_accuracies) / len(val_accuracies)
+            self.log(
+                "val_hit_efficiency",
+                0.0,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                add_dataloader_idx=False,
+            )
+        if accuracies:
+            self.log(
+                "val_hit_accuracy",
+                float(np.mean(accuracies)),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                add_dataloader_idx=False,
+            )
         else:
-            avg_val_accuracy = 0.0
+            self.log(
+                "val_hit_accuracy",
+                0.0,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                add_dataloader_idx=False,
+            )
+        if purities:
+            self.log(
+                "val_hit_purity",
+                float(np.mean(purities)),
+                on_step=False,
+                on_epoch=True,
+                add_dataloader_idx=False,
+            )
+        if termination_reasons:
+            reason_counts = {reason: termination_reasons.count(reason) for reason in set(termination_reasons)}
+            total = sum(reason_counts.values())
+            for reason, count in reason_counts.items():
+                self.log(
+                    f"val_termination_{reason}",
+                    float(count) / max(total, 1),
+                    on_step=False,
+                    on_epoch=True,
+                    add_dataloader_idx=False,
+                )
+
+        val_loss = None
+        val_loss_value = None
+        if len(self.val_buffer) > 0:
+            try:
+                sample = self.val_buffer.sample(self.hparams.batch_size)
+                states_np, actions_np, next_states_np, rewards_np, dones_np, hf_np, nhf_np, hm_np, nhm_np = sample
+
+                batch_tensors = (
+                    torch.as_tensor(states_np, dtype=torch.float32, device=device),
+                    torch.as_tensor(actions_np, dtype=torch.int64, device=device),
+                    torch.as_tensor(rewards_np, dtype=torch.float32, device=device),
+                    torch.as_tensor(dones_np, dtype=torch.bool, device=device),
+                    torch.as_tensor(next_states_np, dtype=torch.float32, device=device),
+                    torch.as_tensor(hf_np, dtype=torch.float32, device=device),
+                    torch.as_tensor(nhf_np, dtype=torch.float32, device=device),
+                    torch.as_tensor(hm_np, dtype=torch.bool, device=device),
+                    torch.as_tensor(nhm_np, dtype=torch.bool, device=device),
+                )
+                val_loss = self.dqn_mse_loss(batch_tensors)
+                val_loss_value = float(val_loss.item())
+            except Exception as exc:
+                logger.warning("Validation loss computation failed: %s", exc)
+
+        if val_loss_value is None:
+            val_loss_value = 1e6
+
         self.log(
-            "val_hit_accuracy",
-            avg_val_accuracy,
+            "val_loss",
+            val_loss_value,
             on_step=False,
             on_epoch=True,
             prog_bar=True,
+            add_dataloader_idx=False,
         )
-        if len(val_accuracies) > 0:
-            # Track validation accuracy statistics
-            self.log("val_accuracy_max", max(val_accuracies), on_step=False, on_epoch=True)
-            self.log("val_accuracy_min", min(val_accuracies), on_step=False, on_epoch=True)
-            self.log("val_accuracy_std", float(np.std(val_accuracies)), on_step=False, on_epoch=True)
-        else:
-            self.log("val_accuracy_max", 0.0, on_step=False, on_epoch=True)
-            self.log("val_accuracy_min", 0.0, on_step=False, on_epoch=True)
-            self.log("val_accuracy_std", 0.0, on_step=False, on_epoch=True)
 
-        if hasattr(val_env, 'get_rank_selection_metrics'):
-            rank_metrics = val_env.get_rank_selection_metrics()
-            for rank, stats in rank_metrics.items():
-                total = float(stats.get("total", 0))
-                correct = float(stats.get("correct", 0))
-                accuracy = float(stats.get("accuracy", 0.0))
-                # Avoid flooding logs with empty ranks
-                if total <= 0:
-                    continue
-                self.log(
-                    f"val_rank_{rank}_accuracy",
-                    accuracy,
-                    on_step=False,
-                    on_epoch=True,
-                )
-                self.log(
-                    f"val_rank_{rank}_selections",
-                    total,
-                    on_step=False,
-                    on_epoch=True,
-                )
-                self.log(
-                    f"val_rank_{rank}_correct",
-                    correct,
-                    on_step=False,
-                    on_epoch=True,
-                )
-
-            if rank_metrics:
-                rank_summary = ", ".join(
-                    f"{rank}:{stats['accuracy']:.3f} ({int(stats['correct'])}/{int(stats['total'])})"
-                    for rank, stats in sorted(rank_metrics.items())
-                    if stats.get("total", 0)
-                )
-                if rank_summary:
-                    self.print(f"[val] rank accuracy: {rank_summary}")
-        elif hasattr(val_env, 'total_selections') and val_env.total_selections > 0:
-            # Single episode accuracy
-            current_val_accuracy = val_env.correct_selections / val_env.total_selections
-            self.log("val_hit_accuracy", current_val_accuracy, on_step=False, on_epoch=True, prog_bar=True)
-        
-        # Log validation rewards
-        if len(val_rewards_list) > 0:
-            avg_val_reward = sum(val_rewards_list) / len(val_rewards_list)
-            self.log("val_episode_reward", avg_val_reward, on_step=False, on_epoch=True)
-            self.log("val_reward_max", max(val_rewards_list), on_step=False, on_epoch=True)
-            self.log("val_reward_min", min(val_rewards_list), on_step=False, on_epoch=True)
-        
-        # Log validation termination reasons and completion statistics
-        if len(val_termination_reasons) > 0:
-            term_counts = Counter(val_termination_reasons)
-            total_val_episodes = len(val_termination_reasons)
-            for reason, count in term_counts.items():
-                self.log(f"val_episode_termination_{reason}", count / total_val_episodes, on_step=False, on_epoch=True)
-        
-        if len(val_completion_ratios) > 0:
-            avg_val_completion = np.mean(val_completion_ratios)
-            self.log("val_avg_completion_ratio", avg_val_completion, on_step=False, on_epoch=True)
-        
-        if len(val_expected_hits_list) > 0 and len(val_predicted_hits_list) > 0:
-            avg_val_expected = np.mean(val_expected_hits_list)
-            avg_val_predicted = np.mean(val_predicted_hits_list)
-            avg_val_correct = np.mean(val_correct_hits_list) if len(val_correct_hits_list) > 0 else 0
-            self.log("val_avg_expected_hits", avg_val_expected, on_step=False, on_epoch=True)
-            self.log("val_avg_predicted_hits", avg_val_predicted, on_step=False, on_epoch=True)
-            self.log("val_avg_correct_hits", avg_val_correct, on_step=False, on_epoch=True)
-            if avg_val_expected > 0:
-                # Efficiency = correct hits / expected hits (not predicted / expected)
-                self.log("val_hit_efficiency_ratio", avg_val_correct / avg_val_expected, on_step=False, on_epoch=True)
-                # Also log purity = correct hits / predicted hits
-                if avg_val_predicted > 0:
-                    self.log("val_hit_purity_ratio", avg_val_correct / avg_val_predicted, on_step=False, on_epoch=True)
-        
-        # Return average loss
-        return torch.tensor(avg_val_loss if len(val_losses) > 0 else 0.0, device=device)
+        if efficiencies:
+            loss_tensor = (
+                val_loss
+                if val_loss is not None
+                else torch.tensor(val_loss_value, device=device)
+            )
+            return OrderedDict(val_loss=loss_tensor)
+        return OrderedDict()
 
     def configure_optimizers(self) -> List[Optimizer]:
         """Initialize Adam optimizer with learning rate scheduling."""
@@ -1031,13 +735,13 @@ class DQNLightning(LightningModule):
         scheduler = {
             'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
-                mode='min',  # Monitor loss (minimize)
-                factor=0.5,  # Reduce LR by half
-                patience=20,  # Wait 20 epochs without improvement
-                min_lr=1e-6,  # Minimum learning rate
+                mode='min',  # train_loss should decrease
+                factor=0.5,
+                patience=20,
+                min_lr=1e-6,
             ),
-            'monitor': 'val_loss',  # Monitor validation loss
-            'interval': 'epoch',  # Check every epoch
+            'monitor': 'train_loss',
+            'interval': 'epoch',
             'frequency': 1,
         }
         
@@ -1062,23 +766,45 @@ class DQNLightning(LightningModule):
             # New format: includes hit_features
             states, actions, rewards, dones, next_states, hit_features, next_hit_features, hit_masks, next_hit_masks = zip(*batch)
         
-        # Convert each state/next_state to numpy array and ensure shape (4,)
+        # Determine expected state dimension dynamically from the environment
+        state_dim = getattr(getattr(self, "agent", None), "env", None)
+        if state_dim is not None and getattr(state_dim, "observation_space", None) is not None:
+            state_dim = int(state_dim.observation_space.shape[0])
+        else:
+            # Fallback: infer from the first state in the batch
+            sample_state = first_item[0]
+            state_dim = len(np.asarray(sample_state, dtype=np.float32).flatten())
+            if state_dim == 0:
+                state_dim = 4
         states_list = []
         next_states_list = []
         for state, next_state in zip(states, next_states):
-            state_arr = np.asarray(state, dtype=np.float32).flatten()
-            next_state_arr = np.asarray(next_state, dtype=np.float32).flatten()
-            
-            # Ensure shape is (4,)
-            if state_arr.shape != (4,):
-                state_arr = np.pad(state_arr[:4], (0, max(0, 4 - len(state_arr))), mode='constant')[:4]
-            if next_state_arr.shape != (4,):
-                next_state_arr = np.pad(next_state_arr[:4], (0, max(0, 4 - len(next_state_arr))), mode='constant')[:4]
-            
-            states_list.append(state_arr)
-            next_states_list.append(next_state_arr)
-        
-        # Stack into 2D arrays: (batch_size, 4)
+            if state is None:
+                state_arr = np.zeros(state_dim, dtype=np.float32)
+            else:
+                state_arr = np.asarray(state, dtype=np.float32).flatten()
+                if state_arr.shape[0] != state_dim:
+                    print(
+                        f"[Collate] Adjusting state dim from {state_arr.shape} to {state_dim}"
+                    )
+                if state_arr.shape[0] < state_dim:
+                    state_arr = np.pad(state_arr, (0, state_dim - state_arr.shape[0]), mode='constant')
+                elif state_arr.shape[0] > state_dim:
+                    state_arr = state_arr[:state_dim]
+            if next_state is None:
+                next_state_arr = np.zeros(state_dim, dtype=np.float32)
+            else:
+                next_state_arr = np.asarray(next_state, dtype=np.float32).flatten()
+                if next_state_arr.shape[0] != state_dim:
+                    print(
+                        f"[Collate] Adjusting next_state dim from {next_state_arr.shape} to {state_dim}"
+                    )
+                if next_state_arr.shape[0] < state_dim:
+                    next_state_arr = np.pad(next_state_arr, (0, state_dim - next_state_arr.shape[0]), mode='constant')
+                elif next_state_arr.shape[0] > state_dim:
+                    next_state_arr = next_state_arr[:state_dim]
+            states_list.append(state_arr.astype(np.float32))
+            next_states_list.append(next_state_arr.astype(np.float32))
         states_array = np.array(states_list, dtype=np.float32)
         next_states_array = np.array(next_states_list, dtype=np.float32)
         
@@ -1128,8 +854,8 @@ class DQNLightning(LightningModule):
             raise ValueError(f"Batch size mismatch: states={batch_size}, dones={len(dones_array)}")
         
         # Final validation before tensor conversion
-        assert states_array.shape == (batch_size, 4), f"States shape {states_array.shape} != ({batch_size}, 4)"
-        assert next_states_array.shape == (batch_size, 4), f"Next states shape {next_states_array.shape} != ({batch_size}, 4)"
+        assert states_array.shape == (batch_size, state_dim), f"States shape {states_array.shape} != ({batch_size}, {state_dim})"
+        assert next_states_array.shape == (batch_size, state_dim), f"Next states shape {next_states_array.shape} != ({batch_size}, {state_dim})"
         assert rewards_array.shape == (batch_size,), f"Rewards shape {rewards_array.shape} != ({batch_size},)"
         assert actions_array.shape == (batch_size,), f"Actions shape {actions_array.shape} != ({batch_size},)"
         assert dones_array.shape == (batch_size,), f"Dones shape {dones_array.shape} != ({batch_size},)"

@@ -71,12 +71,28 @@ class StraightLineTrackingEnv:
         hit_filters: Optional[Dict] = None,
         use_distance_reward: bool = False,
         deterministic: bool = False,
+        hit_feature_mode: str = "absolute",
+        state_feature_mode: str = "full",
     ):
         self.data_loader = iter(data_loader)
         self.particle_filters = particle_filters or {}
         self.hit_filters = hit_filters or {}
         self.use_distance_reward = use_distance_reward
         self.deterministic = deterministic
+        self.hit_feature_mode = (hit_feature_mode or "absolute").lower()
+        if self.hit_feature_mode not in {"absolute", "relative"}:
+            logger.warning(
+                "Unsupported hit_feature_mode '%s'; defaulting to 'absolute'.",
+                hit_feature_mode,
+            )
+            self.hit_feature_mode = "absolute"
+        self.state_feature_mode = (state_feature_mode or "full").lower()
+        if self.state_feature_mode not in {"full", "reduced"}:
+            logger.warning(
+                "Unsupported state_feature_mode '%s'; defaulting to 'full'.",
+                state_feature_mode,
+            )
+            self.state_feature_mode = "full"
 
         self.layer_surfaces = self._load_layer_geometry()
 
@@ -97,7 +113,11 @@ class StraightLineTrackingEnv:
         self.current_rewards: list[float] = []
         self.current_predicted_point: Optional[np.ndarray] = None
         self.current_info: Dict[str, object] = {}
-        self.candidate_distance_max = 10.0  # cm (~0.1 m) tolerance for candidate gathering
+        self.current_target_volume: Optional[int] = None
+        self.current_target_layer_raw: Optional[int] = None
+        self.current_target_unique_layer: Optional[int] = None
+        self.current_remaining_hits: int = 0
+        self.candidate_distance_max = 100.0  # millimetres (~10 cm) tolerance for candidate gathering
 
         self.distance_history: list[float] = []
         self.distance_sum: float = 0.0
@@ -111,8 +131,9 @@ class StraightLineTrackingEnv:
         self.last_episode_stats: Optional[Dict[str, float]] = None
         self.truth_hit_total: int = 0
 
+        self.state_feature_dim = 15 if self.state_feature_mode == "full" else 11
         self.observation_space = Box(
-            low=-200.0, high=200.0, shape=(4,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.state_feature_dim,), dtype=np.float32
         )
         self.action_space = Discrete(self.MAX_CANDIDATES)
 
@@ -176,7 +197,24 @@ class StraightLineTrackingEnv:
         layers_per_particle = filtered.groupby("particle_id")[
             "unique_layer_id"
         ].nunique()
-        keep = layers_per_particle[layers_per_particle >= self.SEED_LENGTH].index
+        required_layers = self.SEED_LENGTH + 1
+        keep = layers_per_particle[layers_per_particle >= required_layers].index
+
+        if len(keep) == 0:
+            logger.warning(
+                "apply_particle_filters() removed all particles: none had >= %d layers after filtering.",
+                required_layers,
+            )
+            return filtered.iloc[0:0]
+
+        dropped = set(filtered["particle_id"].unique()) - set(keep)
+        if dropped:
+            logger.info(
+                "apply_particle_filters() dropped %d particles with insufficient layers (required %d).",
+                len(dropped),
+                required_layers,
+            )
+
         return filtered[filtered["particle_id"].isin(keep)]
 
     def load_next_file(self) -> None:
@@ -196,6 +234,9 @@ class StraightLineTrackingEnv:
 
             hits = self._apply_particle_filters(hits)
             if hits.empty:
+                logger.warning(
+                    "load_next_file() filtered event produced no valid hits; skipping event."
+                )
                 continue
 
             self.all_hits = hits
@@ -216,55 +257,90 @@ class StraightLineTrackingEnv:
 
         self.all_hits = None
         self.pids_to_explore = []
+        logger.warning("load_next_file() exhausted data loader with no remaining events.")
 
     # ------------------------------------------------------------------
     # Episode lifecycle
     # ------------------------------------------------------------------
 
     def reset(self):
-        if self.all_hits is None or self.particle_index >= len(self.pids_to_explore):
-            self.load_next_file()
+        """Reset environment to a valid track, skipping empty ones."""
+        attempts = 0
 
-        if self.all_hits is None or not self.pids_to_explore:
-            return None, {}
+        while True:
+            if self.all_hits is None or self.particle_index >= len(self.pids_to_explore):
+                self.load_next_file()
 
-        particle_id = self.pids_to_explore[self.particle_index]
-        self.particle_index += 1
+            if self.all_hits is None or not self.pids_to_explore:
+                logger.warning("reset() could not find any particles to explore in loaded file.")
+                return None, {}
 
-        track = self.all_hits[self.all_hits["particle_id"] == particle_id].copy()
-        track = track.sort_values(
-            ["unique_layer_id", "r", "z"], kind="stable"
-        ).reset_index(drop=True)
-        track = track.drop_duplicates(subset="unique_layer_id", keep="first").reset_index(
-            drop=True
-        )
-        self.truth_hits = track
-        self.truth_hit_total = len(track)
-        self.current_track = track
+            if attempts >= len(self.pids_to_explore):
+                logger.warning(
+                    "reset() exhausted available particles without finding a valid next state."
+                )
+                return None, {}
 
-        seed_len = min(self.SEED_LENGTH, len(track))
-        self.accepted_hits = track.iloc[:seed_len].copy()
-        self.seed_hit_ids = set(self.accepted_hits["hit_id"].astype(int))
-        self.current_target_index = seed_len
-        self.hit_number = seed_len
+            particle_id = self.pids_to_explore[self.particle_index]
+            self.particle_index += 1
+            attempts += 1
 
-        self.current_candidates = None
-        self.current_candidate_mask = None
-        self.current_truth_hit_ids = set()
-        self.current_rewards = []
-        self.current_predicted_point = None
-        self.distance_history.clear()
-        self.distance_sum = 0.0
-        self.distance_count = 0
+            track = self.all_hits[self.all_hits["particle_id"] == particle_id].copy()
+            track = track.sort_values(
+                ["unique_layer_id", "r", "z"], kind="stable"
+            ).reset_index(drop=True)
+            track = track.drop_duplicates(
+                subset="unique_layer_id", keep="first"
+            ).reset_index(drop=True)
 
-        self.total_selections = 0
-        self.correct_selections = 0
-        self.rank_selection_counts.clear()
-        self.rank_correct_counts.clear()
-        self.last_selected_hit = None
-        self.last_episode_stats = None
+            if len(track) < self.SEED_LENGTH:
+                logger.warning(
+                    "reset() skipping particle %s: only %d hits available (need %d).",
+                    particle_id,
+                    len(track),
+                    self.SEED_LENGTH,
+                )
+                continue
 
-        return self.get_current_state()
+            self.truth_hits = track
+            self.truth_hit_total = len(track)
+            self.current_track = track
+
+            seed_len = min(self.SEED_LENGTH, len(track))
+            self.accepted_hits = track.iloc[:seed_len].copy()
+            self.seed_hit_ids = set(self.accepted_hits["hit_id"].astype(int))
+            self.current_target_index = seed_len
+            self.hit_number = seed_len
+
+            self.current_candidates = None
+            self.current_candidate_mask = None
+            self.current_truth_hit_ids = set()
+            self.current_rewards = []
+            self.current_predicted_point = None
+            self.distance_history.clear()
+            self.distance_sum = 0.0
+            self.distance_count = 0
+            self.current_target_volume = None
+            self.current_target_layer_raw = None
+            self.current_target_unique_layer = None
+            self.current_remaining_hits = 0
+
+            self.total_selections = 0
+            self.correct_selections = 0
+            self.rank_selection_counts.clear()
+            self.rank_correct_counts.clear()
+            self.last_selected_hit = None
+            self.last_episode_stats = None
+
+            state, info = self.get_current_state()
+            if state is not None:
+                return state, info
+
+            logger.warning(
+                "reset() skipping particle %s: no valid state produced (attempt %d).",
+                particle_id,
+                attempts,
+            )
 
     # ------------------------------------------------------------------
     # Straight-line propagation helpers
@@ -392,13 +468,19 @@ class StraightLineTrackingEnv:
         predicted_point: np.ndarray,
         layer_hits: pd.DataFrame,
     ) -> Tuple[pd.DataFrame, np.ndarray]:
+        columns = ["hit_id", "x", "y", "z", "r", "distance"]
         if layer_hits.empty:
-            return pd.DataFrame(), np.zeros(self.MAX_CANDIDATES, dtype=bool)
+            return pd.DataFrame(columns=columns), np.zeros(self.MAX_CANDIDATES, dtype=bool)
+
+        # Ensure core columns are present even if upstream transformations dropped them
+        for col in ["hit_id", "x", "y", "z", "r"]:
+            if col not in layer_hits.columns:
+                layer_hits[col] = self.all_hits.loc[layer_hits.index, col].values
 
         used_ids = set(self.accepted_hits["hit_id"].astype(int))
         layer_hits = layer_hits[~layer_hits["hit_id"].isin(used_ids)]
         if layer_hits.empty:
-            return pd.DataFrame(), np.zeros(self.MAX_CANDIDATES, dtype=bool)
+            return pd.DataFrame(columns=columns), np.zeros(self.MAX_CANDIDATES, dtype=bool)
 
         layer_hits = layer_hits.copy()
         coords = layer_hits[["x", "y", "z"]].to_numpy()
@@ -406,7 +488,7 @@ class StraightLineTrackingEnv:
         layer_hits["distance"] = distances
         layer_hits = layer_hits[layer_hits["distance"] <= self.candidate_distance_max]
         if layer_hits.empty:
-            return pd.DataFrame(), np.zeros(self.MAX_CANDIDATES, dtype=bool)
+            return pd.DataFrame(columns=columns), np.zeros(self.MAX_CANDIDATES, dtype=bool)
 
         layer_hits = layer_hits.sort_values("distance")
         candidates = layer_hits.head(self.MAX_CANDIDATES).reset_index(drop=True)
@@ -430,12 +512,66 @@ class StraightLineTrackingEnv:
 
     def _current_observation(self) -> np.ndarray:
         last_hit = self.accepted_hits.iloc[-1]
-        r = float(last_hit.get("r", np.hypot(last_hit["x"], last_hit["y"])))
-        obs = np.array(
-            [last_hit["z"], r, last_hit["x"], last_hit["y"]],
-            dtype=np.float32,
-        )
-        return np.clip(obs, -200.0, 200.0)
+        z = float(last_hit["z"])
+        x = float(last_hit["x"])
+        y = float(last_hit["y"])
+        r = float(last_hit.get("r", np.hypot(x, y)))
+
+        coord_scale = 300.0
+        delta_scale = 50.0
+        layer_scale = 50.0
+        volume_scale = 20.0
+
+        features: list[float] = []
+
+        features.extend([
+            z / coord_scale,
+            r / coord_scale,
+            x / coord_scale,
+            y / coord_scale,
+        ])
+
+        if len(self.accepted_hits) >= 2:
+            prev = self.accepted_hits.iloc[-2]
+            prev_z = float(prev["z"])
+            prev_x = float(prev["x"])
+            prev_y = float(prev["y"])
+            prev_r = float(prev.get("r", np.hypot(prev_x, prev_y)))
+            features.extend([
+                (z - prev_z) / delta_scale,
+                (r - prev_r) / delta_scale,
+                (x - prev_x) / delta_scale,
+                (y - prev_y) / delta_scale,
+            ])
+        else:
+            features.extend([0.0, 0.0, 0.0, 0.0])
+
+        if self.current_predicted_point is not None:
+            pred_x, pred_y, pred_z = self.current_predicted_point.tolist()
+            pred_r = np.hypot(pred_x, pred_y)
+            features.extend([
+                (pred_z - z) / delta_scale,
+                (pred_r - r) / delta_scale,
+                (pred_x - x) / delta_scale,
+                (pred_y - y) / delta_scale,
+            ])
+        else:
+            features.extend([0.0, 0.0, 0.0, 0.0])
+
+        unique_layer = float(self.current_target_unique_layer or 0)
+        volume_id = float(self.current_target_volume or 0)
+        remaining_ratio = 0.0
+        if self.truth_hit_total > 0:
+            remaining_ratio = self.current_remaining_hits / float(self.truth_hit_total)
+
+        features.extend([
+            unique_layer / layer_scale,
+            volume_id / volume_scale,
+            remaining_ratio,
+        ])
+
+        obs = np.array(features, dtype=np.float32)
+        return np.clip(obs, -10.0, 10.0)
 
     # ------------------------------------------------------------------
     # Public API
@@ -447,21 +583,43 @@ class StraightLineTrackingEnv:
             or self.accepted_hits is None
             or self.current_target_index >= len(self.truth_hits)
         ):
+            logger.warning(
+                "get_current_state() unable to proceed: truth_hits=%s, accepted_hits=%s, target_index=%d.",
+                None if self.truth_hits is None else len(self.truth_hits),
+                None if self.accepted_hits is None else len(self.accepted_hits),
+                self.current_target_index,
+            )
+            logger.warning(
+                "get_current_state() called with no remaining truth hits (index=%d, total=%s).",
+                self.current_target_index,
+                None if self.truth_hits is None else len(self.truth_hits),
+            )
             return None, {}
 
         target_row = self.truth_hits.iloc[self.current_target_index]
         target_layer = int(target_row["unique_layer_id"])
+        target_volume = int(target_row["volume_id"])
+        target_layer_id = int(target_row["layer_id"])
+        self.current_target_volume = target_volume
+        self.current_target_layer_raw = target_layer_id
+        self.current_target_unique_layer = target_layer
 
         points = self.accepted_hits[["x", "y", "z"]].to_numpy()
         line_origin, line_direction = self._fit_line(points)
 
         layer_hits_full = self.all_hits[
             (self.all_hits["unique_layer_id"] == target_layer)
-            & (self.all_hits["volume_id"] == target_row["volume_id"])
-            & (self.all_hits["layer_id"] == target_row["layer_id"])
+            & (self.all_hits["volume_id"] == target_volume)
+            & (self.all_hits["layer_id"] == target_layer_id)
         ]
 
         if layer_hits_full.empty:
+            logger.warning(
+                "get_current_state() particle %s layer %s (volume %s) has no hits; skipping.",
+                int(target_row.get("particle_id", -1)),
+                target_layer,
+                target_volume,
+            )
             return None, {}
 
         predicted_point = self._intersect_layer(
@@ -471,6 +629,9 @@ class StraightLineTrackingEnv:
         candidates, mask = self._prepare_candidates(
             predicted_point, layer_hits_full
         )
+
+        remaining = max(len(self.truth_hits) - self.current_target_index, 0)
+        self.current_remaining_hits = remaining
 
         truth_hits = self.truth_hits[self.truth_hits["unique_layer_id"] == target_layer]
         truth_hit_ids = set(truth_hits["hit_id"].astype(int).tolist())
@@ -507,7 +668,8 @@ class StraightLineTrackingEnv:
     def step(self, action: int):
         if self.current_candidates is None:
             logger.warning("step() called before get_current_state(); resetting.")
-            return self.reset()
+            state, info = self.reset()
+            return state, 0.0, False, False, info
 
         if not self.current_candidates.empty:
             clamped_action = int(np.clip(action, 0, len(self.current_candidates) - 1))
@@ -555,20 +717,7 @@ class StraightLineTrackingEnv:
                 else "no_candidates"
             )
             expected_hits = max(self.truth_hit_total - self.SEED_LENGTH, 0)
-            self.last_episode_stats = {
+            episode_stats = {
                 "reason": reason,
                 "total_selections": self.total_selections,
-                "correct_selections": self.correct_selections,
-                "expected_hits": float(expected_hits),
-            }
-            next_state, info = self.reset()
-        else:
-            next_state, info = self.get_current_state()
-
-        self.current_info = info
-        truncated = False
-        return next_state, reward, done, truncated, info
-
-
-class TrackingEnv(StraightLineTrackingEnv):
-    """Backward-compatible alias for legacy imports."""
+                "correct_selections": self.correct_selec

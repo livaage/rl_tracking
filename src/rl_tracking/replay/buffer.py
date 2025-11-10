@@ -40,12 +40,13 @@ class ReplayBuffer(object):
         
         # Ensure all states have consistent shape - convert to numpy arrays and ensure same shape
         # Determine state dimensionality from available samples
-        state_dim = None
+        state_dim = 0
         for candidate in list(states) + list(next_states):
             if candidate is not None:
-                state_dim = len(np.asarray(candidate, dtype=np.float32).flatten())
-                break
-        if state_dim is None:
+                candidate_len = len(np.asarray(candidate, dtype=np.float32).flatten())
+                if candidate_len > state_dim:
+                    state_dim = candidate_len
+        if state_dim == 0:
             state_dim = 4  # Fallback if all states are None
 
         states_list = []
@@ -156,3 +157,7 @@ class ReplayBuffer(object):
 
     def __len__(self):
         return len(self.buffer)
+
+    # def clear(self) -> None:
+    #     """Remove all stored experiences."""
+    #     self.buffer.clear()

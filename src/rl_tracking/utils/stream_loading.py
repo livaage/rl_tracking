@@ -8,6 +8,9 @@ from sklearn.model_selection import train_test_split
 from typing import Iterable, Sequence, List, Set, Dict
 from collections import Counter
 import numpy as np
+from rl_tracking.utils.logger import get_logger
+
+logger = get_logger()
 class RLKernelIterableDataset(IterableDataset):
     def __init__(self, event_numbers: list[str], event_processor=None):
         super().__init__()
@@ -19,7 +22,12 @@ class RLKernelIterableDataset(IterableDataset):
 
     def _read_file(self, event_number):
         # Efficiently read a file in chunks if needed
-        sample = self.event_processor.process(event_number)
+        logger.info("Processing event %s", event_number)
+        try:
+            sample = self.event_processor.process(event_number)
+        except Exception as exc:
+            logger.error("Failed to process event %s: %s", event_number, exc)
+            raise
         yield sample
         self.sample_count += 1
 

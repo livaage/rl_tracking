@@ -1,71 +1,57 @@
-# Multi-Agent Training Configuration File
-# Configuration for simultaneous track propagation with multiple agents
-
-# Data Configuration
 data:
-  data_dir: "/scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data/part_1"
-  base_dir: "/scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data"
-  include_all_parts: true
-  parts_glob: "part_*"
+  base_dir: /scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data
   batch_size: 32
-  val_split: 0.2
-  test_split: 0.1
-  num_workers: 0
-  random_seed: 42
+  data_dir: /scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data/part_1
   event_processor:
     n_neighbors: 20
-
-# Model Hyperparameters
-model:
-  num_agents: 10  # Number of agents (tracks) to propagate simultaneously
-  batch_size: 32
-  lr: 0.0005
-  gamma: 0.99
-  sync_rate: 10
-  replay_size: 10000
-  warm_start_size: 1000
-  eps_last_frame: 5000
-  eps_start: 1.0
-  eps_end: 0.01
-  episode_length: 200
-  warm_start_steps: 2000
-
-# Environment Filters
+  include_all_parts: true
+  num_workers: 0
+  parts_glob: part_*
+  random_seed: 42
+  test_split: 0.1
+  val_split: 0.2
 environment:
-  particle_filters:
-    pt: 0.5
-    nhits_min: 4
-    nhits_max: 20
   hit_filters: {}
+  particle_filters:
+    nhits_max: 20
+    nhits_min: 4
+    pt: 0.5
+  proximity_threshold: 50.0
   use_distance_reward: false
   use_truth_path_plan: true
-  proximity_threshold: 50.0  # Group tracks within this distance (cm)
-
-# Trainer Configuration
+model:
+  batch_size: 32
+  episode_length: 200
+  eps_end: 0.01
+  eps_last_frame: 5000
+  eps_start: 1.0
+  gamma: 0.99
+  lr: 0.0005
+  num_agents: 10
+  replay_size: 10000
+  sync_rate: 10
+  warm_start_size: 1000
+  warm_start_steps: 2000
 trainer:
-  max_epochs: 5000
-  accelerator: "gpu"
-  devices: 1
-  log_every_n_steps: 10
-  gradient_clip_val: 10.0
+  accelerator: gpu
   callbacks:
     checkpoint:
-      monitor: "val_loss"
-      save_top_k: 1
-      mode: "min"
-      filename: "best-{epoch:02d}-{val_loss:.4f}"
+      filename: best-{epoch:02d}-{val_hit_accuracy:.4f}
+      mode: max
+      monitor: val_hit_accuracy
       save_last: true
+      save_top_k: 1
     early_stopping:
-      monitor: "val_hit_accuracy"
-      mode: "max"
-      patience: 50
-      min_delta: 0.001
       check_val_every_n_epoch: 1
-
-# Wandb Configuration
+      min_delta: 0.001
+      mode: max
+      monitor: val_hit_accuracy
+      patience: 50
+  devices: 1
+  gradient_clip_val: 10.0
+  log_every_n_steps: 10
+  max_epochs: 5000
 wandb:
-  project: "RLTracking"
-  name: "multiagent_initial_run"
   log_model: true
-
-
+  name: multiagent_initial_run
+  project: RLTracking

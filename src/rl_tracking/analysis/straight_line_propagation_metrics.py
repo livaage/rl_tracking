@@ -267,6 +267,14 @@ def enumerate_steps(
             dists = np.linalg.norm(candidate_positions - prediction[None, :], axis=1)
             valid_mask = dists <= CANDIDATE_DISTANCE_MAX
             if not valid_mask.any():
+                summary.update(
+                    StepMetrics(
+                        truth_rank=max_candidates + 1,
+                        num_candidates=0,
+                        distance_to_truth=float("nan"),
+                    ),
+                    top_k=top_k,
+                )
                 continue
             candidate_positions = candidate_positions[valid_mask]
             candidate_hit_ids = candidate_hit_ids[valid_mask]

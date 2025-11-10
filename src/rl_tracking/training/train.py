@@ -16,7 +16,10 @@ from rl_tracking.utils.config_loader import load_config
 from rl_tracking.utils.data_paths import resolve_data_directories
 
 DEFAULT_TRACKML_DIR = Path("/scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data/part_1")
-
+import inspect
+from rl_tracking.environment import agent as agent_module
+print("Using rl_tracking from:", agent_module.__file__)
+print("Agent class defined at:", inspect.getfile(agent_module.Agent))
 
 def main(config_path: str | Path):
     """Main training function.
@@ -133,10 +136,10 @@ def main(config_path: str | Path):
     early_stopping_config = trainer_config.get('callbacks', {}).get('early_stopping', {})
     
     checkpoint_callback = ModelCheckpoint(
-        monitor=checkpoint_config.get('monitor', 'val_loss'),
+        monitor=checkpoint_config.get('monitor', 'val_hit_accuracy'),
         save_top_k=checkpoint_config.get('save_top_k', 1),
-        mode=checkpoint_config.get('mode', 'min'),
-        filename=checkpoint_config.get('filename', 'best-{epoch:02d}-{val_loss:.4f}'),
+        mode=checkpoint_config.get('mode', 'max'),
+        filename=checkpoint_config.get('filename', 'best-{epoch:02d}-{val_hit_accuracy:.4f}'),
         save_last=checkpoint_config.get('save_last', True),  # Also save last checkpoint
         dirpath=str(checkpoint_dir),  # Save checkpoints in experiment-specific directory
     )
@@ -151,7 +154,7 @@ def main(config_path: str | Path):
     # This tracks actual policy quality, not just reduced exploration
     early_stopping_callback = EarlyStopping(
         monitor=early_stopping_config.get('monitor', 'val_hit_accuracy'),
-        mode=early_stopping_config.get('mode', 'max'),  # Stop when accuracy stops increasing
+        mode=early_stopping_config.get('mode', 'max'),  # Stop when efficiency stops increasing
         patience=early_stopping_config.get('patience', 50),  # Wait 50 validation checks
         min_delta=early_stopping_config.get('min_delta', 0.001),  # Minimum change to qualify as improvement
         verbose=True,
