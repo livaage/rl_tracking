@@ -6,6 +6,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import mplhep as hep
+import matplotlib.colors as colors
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -21,7 +22,129 @@ import pandas as pd
 
 DEFAULT_TRACKML_DIR = Path("/scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data/part_1")
 
-def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str = None, output_dir: str = None):
+
+def _get_tick_label_size(ax) -> float:
+    """Return a representative tick label font size for the provided axes."""
+    tick_sizes = []
+    for label in ax.get_xticklabels() + ax.get_yticklabels():
+        size = label.get_size()
+        if size:
+            tick_sizes.append(size)
+    if tick_sizes:
+        return float(max(tick_sizes))
+    # Fallback to rcParams defaults if ticks haven't been populated yet
+    return float(
+        plt.rcParams.get(
+            "xtick.labelsize",
+            plt.rcParams.get("ytick.labelsize", plt.rcParams.get("font.size", 12)),
+        )
+    )
+
+
+def plot_zero_correct_track(
+    track_id: int,
+    track_df: pd.DataFrame,
+    seed_hits_df: pd.DataFrame,
+    env: TrackingEnv,
+    failure_details: list,
+    output_path: Path,
+) -> None:
+    """Create a diagnostic plot for tracks where no correct hits were found."""
+    if track_df is None or track_df.empty:
+        return
+
+    seed_points = (
+        seed_hits_df[["x", "y", "z"]].to_numpy(dtype=float)
+        if seed_hits_df is not None and not seed_hits_df.empty
+        else track_df[["x", "y", "z"]].head(2).to_numpy(dtype=float)
+    )
+
+    origin = np.zeros(3, dtype=float)
+    direction = np.array([0.0, 0.0, 1.0], dtype=float)
+    try:
+        if seed_points.shape[0] >= 2:
+            origin, direction = env._fit_line(seed_points)
+        elif seed_points.shape[0] == 1:
+            origin = seed_points[0]
+    except Exception:
+        pass
+
+    norm = np.linalg.norm(direction)
+    if norm < 1e-9:
+        direction = np.array([0.0, 0.0, 1.0], dtype=float)
+        norm = 1.0
+    direction = direction / norm
+
+    hits = track_df[["x", "y", "z"]].to_numpy(dtype=float)
+    if hits.size == 0:
+        return
+
+    # Determine line extent based on furthest truth hit from the origin along the direction
+    offsets = hits - origin
+    projections = offsets @ direction
+    max_extent = float(np.max(np.abs(projections))) if projections.size else 100.0
+    if max_extent < 1.0:
+        max_extent = 100.0
+    t_vals = np.linspace(-max_extent, max_extent, 200)
+    line_points = origin + np.outer(t_vals, direction)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # XY projection
+    axes[0].scatter(track_df["x"], track_df["y"], c="tab:blue", label="truth hits")
+    if seed_hits_df is not None and not seed_hits_df.empty:
+        axes[0].scatter(
+            seed_hits_df["x"], seed_hits_df["y"], c="tab:orange", marker="s", label="seed hits"
+        )
+    axes[0].plot(line_points[:, 0], line_points[:, 1], "--", color="black", label="seed line")
+    axes[0].set_xlabel("x [mm]")
+    axes[0].set_ylabel("y [mm]")
+    axes[0].set_title(f"Track {track_id} (x-y)")
+    axes[0].axis("equal")
+    axes[0].legend(loc="best")
+
+    # z-r projection
+    r_track = np.hypot(track_df["x"], track_df["y"])
+    axes[1].scatter(track_df["z"], r_track, c="tab:blue", label="truth hits")
+    if seed_hits_df is not None and not seed_hits_df.empty:
+        r_seed = np.hypot(seed_hits_df["x"], seed_hits_df["y"])
+        axes[1].scatter(seed_hits_df["z"], r_seed, c="tab:orange", marker="s", label="seed hits")
+    r_line = np.hypot(line_points[:, 0], line_points[:, 1])
+    axes[1].plot(line_points[:, 2], r_line, "--", color="black", label="seed line")
+    axes[1].set_xlabel("z [mm]")
+    axes[1].set_ylabel("r [mm]")
+    axes[1].set_title(f"Track {track_id} (z-r)")
+
+    summary_lines = []
+    if failure_details:
+        summary_lines.append("Problematic layers:")
+        for detail in failure_details[:5]:
+            layer = detail.get("layer", "N/A")
+            failure_type = detail.get("failure_type", "unknown")
+            min_dist = detail.get("min_truth_distance")
+            threshold = detail.get("distance_threshold")
+            line = f"Layer {layer}: {failure_type}"
+            if isinstance(min_dist, (float, int)):
+                line += f", min_dist={min_dist:.1f} mm"
+            if isinstance(threshold, (float, int)):
+                line += f", thresh={threshold:.1f} mm"
+            summary_lines.append(line)
+
+    fig.suptitle(f"Track {track_id}: No Correct Hits", fontsize=14)
+    if summary_lines:
+        fig.text(
+            0.5,
+            0.02,
+            "\n".join(summary_lines),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+    fig.tight_layout(rect=[0, 0.05, 1, 0.98])
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str = None, output_dir: str = None, use_error_bars: bool = False):
     """Evaluate a trained model on the test set track-by-track.
     
     Args:
@@ -31,6 +154,7 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         test_data_dir: Optional path to test data directory (if different from config)
         output_dir: Optional directory to store evaluation artifacts (plots, logs).
                     Defaults to <checkpoint_dir>/evaluation/<checkpoint_name>
+        use_error_bars: If True, efficiency plots include mean ± std error bars; otherwise just mean curves.
     """
     checkpoint_path = Path(model_path).expanduser()
     if checkpoint_path.is_dir():
@@ -48,6 +172,13 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     model_path = str(checkpoint_path)
     checkpoint_dir = checkpoint_path.parent
     checkpoint_stem = checkpoint_path.stem
+    if output_dir is not None:
+        plot_dir = Path(output_dir).expanduser()
+    else:
+        evaluation_root = checkpoint_dir / "evaluation"
+        plot_dir = evaluation_root / checkpoint_stem
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Saving evaluation artifacts to: {plot_dir}")
 
     # If config_path not provided, try to find it in checkpoint directory
     if config_path is None:
@@ -118,6 +249,7 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     use_truth_path_plan = environment_config.get('use_truth_path_plan', False)
     hit_feature_mode = environment_config.get('hit_feature_mode', 'absolute')
     state_feature_mode = environment_config.get('state_feature_mode', 'full')
+    state_feature_set = environment_config.get('state_feature_set', 'unspecified')
     
     # Ensure particle_filters and hit_filters are dictionaries (not None)
     # Empty dict {} means "no filtering", None means "use defaults"
@@ -139,6 +271,9 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     print(f"Hit filters: {hit_filters}")
     print(f"Use distance reward: {use_distance_reward}")
     print(f"Use truth path plan: {use_truth_path_plan}")
+    print(f"Hit feature mode: {hit_feature_mode}")
+    print(f"State feature mode: {state_feature_mode}")
+    print(f"State feature set: {state_feature_set}")
     print(f"{'='*60}\n")
     
     # Setup for fit first (needed for model initialization which accesses train_dataset)
@@ -189,6 +324,7 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
             use_truth_path_plan = checkpoint_hparams.get('use_truth_path_plan', use_truth_path_plan)
             hit_feature_mode = checkpoint_hparams.get('hit_feature_mode', hit_feature_mode)
             state_feature_mode = checkpoint_hparams.get('state_feature_mode', state_feature_mode)
+            state_feature_set = checkpoint_hparams.get('state_feature_set', state_feature_set)
         else:
             print(f"⚠️  No hyperparameters found in checkpoint. Using config file values.")
             print(f"   This may cause mismatches if config differs from training config!\n")
@@ -214,6 +350,9 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         hit_filters=hit_filters,
         use_distance_reward=use_distance_reward,
         use_truth_path_plan=use_truth_path_plan,
+        hit_feature_mode=hit_feature_mode,
+        state_feature_mode=state_feature_mode,
+        state_feature_set=state_feature_set,
     )
     
     # Print final configuration that will be used for evaluation
@@ -229,6 +368,7 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     print(f"Use truth path plan: {use_truth_path_plan}")
     print(f"Hit feature mode: {hit_feature_mode}")
     print(f"State feature mode: {state_feature_mode}")
+    print(f"State feature set: {state_feature_set}")
     print(f"{'='*60}\n")
     
     # Verify that pt filter is set correctly
@@ -389,6 +529,8 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
             track_expected_hits = 0
             track_reward = 0.0
             track_steps = 0
+            track_df_copy = None
+            seed_subset_copy = None
             
             # Track layers where we found at least one correct hit (for efficiency calculation)
             # Efficiency: count one hit per layer, not all hits
@@ -423,6 +565,7 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                 track_df = test_env.current_track
                 if track_df.empty:
                     continue
+                track_df_copy = track_df.copy()
 
                 correct_hit_ids = set(track_df['hit_id'].astype(int).values)
 
@@ -438,6 +581,7 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                 seed_len = getattr(test_env, 'SEED_LENGTH', 3)
                 track_sorted = track_df.sort_values('unique_layer_id')
                 seed_subset = track_sorted.head(seed_len)
+                seed_subset_copy = seed_subset.copy()
                 seed_hit_ids = set(seed_subset['hit_id'].astype(int).values)
                 seed_layer_ids = set(seed_subset['unique_layer_id'].astype(int).values)
 
@@ -515,6 +659,7 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
             # Reconstruct track step by step
             done = False
             while not done:
+                target_layer_before_step = getattr(test_env, 'current_target_unique_layer', None)
                 info_before = test_agent.info or {}
                 candidate_ids = info_before.get("candidate_hit_ids", [])
                 candidate_mask = info_before.get("hit_mask", np.zeros(num_actions, dtype=bool))
@@ -525,7 +670,6 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                 ]
                 true_action_index = correct_indices[0] if correct_indices else None
 
-                prev_hit_number = getattr(test_env, 'hit_number', 0)
                 reward, done = test_agent.play_step(model.net, epsilon=epsilon, device=device)
 
                 # Update action counts (Agent stores last action in replay buffer entry)
@@ -588,19 +732,6 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                             selected_hit_layer = float(selected_hit.unique_layer_id)
                     if selected_hit_layer is None and hasattr(test_env, 'current_target_unique_layer'):
                         selected_hit_layer = float(test_env.current_target_unique_layer)
-                    if total_tracks < 3:
-                        info_debug = test_agent.info or {}
-                        raw_scores = info_debug.get("raw_scores")
-                        masked_scores = info_debug.get("masked_scores")
-                        chosen_action = info_debug.get("chosen_action")
-                        print(f"    DEBUG Track {total_tracks} Step {track_steps}: selected_hit_id={selected_hit_id}, "
-                              f"layer={selected_hit_layer}, is_seed={selected_hit_id in seed_hit_ids}, "
-                              f"is_correct={selected_hit_id in correct_hit_ids_in_path}, "
-                              f"chosen_action={chosen_action}")
-                        if raw_scores is not None:
-                            print(f"    DEBUG Track {total_tracks} Step {track_steps}: raw_scores={raw_scores}")
-                        if masked_scores is not None:
-                            print(f"    DEBUG Track {total_tracks} Step {track_steps}: masked_scores={masked_scores}")
                     
                     # Track which layer we selected a hit from (only post-seed layers)
                     if selected_hit_layer is not None and initial_start_layer is not None:
@@ -624,10 +755,6 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                                     if selected_hit_layer > initial_start_layer:
                                         layers_with_correct_hit.add(selected_hit_layer)
                             
-                            if total_tracks < 5:
-                                layer_info = f"layer={selected_hit_layer}" if selected_hit_layer is not None else "layer=unknown"
-                                correct_info = "CORRECT" if selected_hit_id in correct_hit_ids_in_path else "WRONG"
-                                print(f"  Track {total_tracks}, Step {track_steps}: Selected hit_id={selected_hit_id} in {layer_info}, {correct_info}")
                 else:
                     # No hit selected - track which layer we skipped (only post-seed layers)
                     # Only count as skipped if we're in a layer that's in the expected path
@@ -685,6 +812,13 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
             # Purity: fraction of predicted hits that were correct
             track_purity = track_correct_hits / track_predicted_hits if track_predicted_hits > 0 else 0.0
             
+            failure_counts = {}
+            failure_details = []
+            if getattr(test_env, "last_episode_stats", None):
+                stats = test_env.last_episode_stats
+                failure_counts = stats.get("layer_failures", {})
+                failure_details = stats.get("layer_failure_details", [])
+            
             # Log path comparison for first few tracks or tracks with issues
             if total_tracks < 5 or track_efficiency < 0.5 or track_efficiency > 1.0 or len(truth_path_layers) == 0:
                 print(f"\n{'='*60}")
@@ -712,6 +846,25 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                     print(f"  Expected hits from path_plan layers: {len(correct_hit_ids_in_path - seed_hit_ids)}")
                     print(f"  Truth hits in path_plan layers: {len([layer for layer in truth_path_layers if layer in expected_path_layers])}")
                 print(f"{'='*60}\n")
+            
+            if failure_details and (total_tracks <= 5 or track_correct_hits == 0):
+                print(f"Layer failure details for track {total_tracks}:")
+                for detail in failure_details:
+                    layer = detail.get("layer", "N/A")
+                    failure_type = detail.get("failure_type", "unknown")
+                    min_dist = detail.get("min_truth_distance")
+                    threshold = detail.get("distance_threshold")
+                    truth_hits_count = detail.get("truth_hit_count", "N/A")
+                    post_filter_count = detail.get("post_filter_count", "N/A")
+                    msg = f"  Layer {layer}: type={failure_type}"
+                    if isinstance(min_dist, (float, int)):
+                        msg += f", min_dist={min_dist:.2f} mm"
+                    if isinstance(threshold, (float, int)):
+                        msg += f", threshold={threshold:.2f} mm"
+                    msg += f", truth_hits={truth_hits_count}"
+                    msg += f", post_filter={post_filter_count}"
+                    print(msg)
+                print()
             
             # Also track why the episode ended (already captured in loop above)
             # termination_reason is already set
@@ -746,6 +899,8 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                 'skipped_count': len(skipped_layers),
                 'layer_correct_count': len(layers_with_correct_hit),
                 'layer_total_count': track_expected_hits,
+                'layer_failure_counts': failure_counts,
+                'layer_failure_details': failure_details,
             })
             
             total_tracks += 1
@@ -753,6 +908,18 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
             total_predicted_hits += track_predicted_hits
             total_expected_hits += track_expected_hits
             progress_bar.update(1)
+
+            if track_correct_hits == 0 and track_df_copy is not None and seed_subset_copy is not None:
+                debug_plot_dir = plot_dir / "debug_zero_correct_tracks"
+                debug_plot_dir.mkdir(parents=True, exist_ok=True)
+                plot_zero_correct_track(
+                    track_id=total_tracks,
+                    track_df=track_df_copy,
+                    seed_hits_df=seed_subset_copy,
+                    env=test_env,
+                    failure_details=failure_details,
+                    output_path=debug_plot_dir / f"track_{total_tracks:05d}.png",
+                )
             
             # Print progress
             if total_tracks % 10 == 0:
@@ -765,6 +932,29 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         print("Reached end of test dataset")
     finally:
         progress_bar.close()
+    
+    failure_rows = []
+    for result in track_results:
+        details = result.get("layer_failure_details", []) or []
+        for detail in details:
+            detail_row = dict(detail)
+            detail_row["track_id"] = result.get("track_id")
+            detail_row["track_pt"] = result.get("pt")
+            detail_row["track_eta"] = result.get("eta")
+            detail_row["termination_reason"] = result.get("termination_reason")
+            failure_rows.append(detail_row)
+    if failure_rows:
+        failure_df = pd.DataFrame(failure_rows)
+        failure_csv = plot_dir / "layer_failure_details.csv"
+        failure_df.to_csv(failure_csv, index=False)
+        print(f"Wrote layer failure details to {failure_csv}")
+
+    zero_correct_tracks = [r for r in track_results if r.get("correct_hits", 0) == 0]
+    if zero_correct_tracks:
+        zero_correct_df = pd.DataFrame(zero_correct_tracks)
+        zero_correct_csv = plot_dir / "zero_correct_tracks.csv"
+        zero_correct_df.to_csv(zero_correct_csv, index=False)
+        print(f"Wrote summary of zero-correct tracks to {zero_correct_csv}")
     
     # Calculate final metrics
     if total_tracks == 0:
@@ -866,15 +1056,6 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     print(f"{'='*60}\n")
     
     # Create plots
-    if output_dir is not None:
-        plot_dir = Path(output_dir).expanduser()
-        plot_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        evaluation_root = checkpoint_dir / "evaluation"
-        plot_dir = evaluation_root / checkpoint_stem
-        plot_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Saving evaluation artifacts to: {plot_dir}")
-    
     # Set CMS style for all plots
     hep.style.use("CMS")
     
@@ -931,15 +1112,16 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         efficiencies_valid = efficiencies_array[valid_mask]
         
         ax.scatter(pts_valid, efficiencies_valid, alpha=0.5, s=20, label='Individual Tracks')
-        ax.set_xlabel('Track p$_T$ (GeV/c)', fontsize=12)
-        ax.set_ylabel('Tracking Efficiency', fontsize=12)
+        tick_size = _get_tick_label_size(ax)
+        ax.set_xlabel('Track p$_T$ (GeV/c)', fontsize=tick_size)
+        ax.set_ylabel('Tracking Efficiency', fontsize=tick_size)
         ax.set_xscale('log')  # Logarithmic x-axis
         ax.grid(True, alpha=0.3, which='both')  # Show grid for both major and minor ticks
         
         # Add average efficiency text box
         avg_eff_pt = np.mean(efficiencies_valid) if len(efficiencies_valid) > 0 else 0.0
-        ax.text(0.02, 0.98, f'Average Efficiency: {avg_eff_pt:.3f}', 
-                transform=ax.transAxes, fontsize=12,
+        ax.text(0.02, 0.98, f'Average Efficiency: {avg_eff_pt:.3f}',
+                transform=ax.transAxes, fontsize=tick_size,
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         # Bin by pt for better visualization using logarithmic bins
@@ -954,18 +1136,24 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
             
             bin_means = []
             bin_centers = []
-            bin_counts = []
+            bin_stds = []
             for i in range(len(log_bins)-1):
                 mask = (pts_valid >= log_bins[i]) & (pts_valid < log_bins[i+1])
                 if mask.sum() > 0:
-                    bin_means.append(np.mean(efficiencies_valid[mask]))
-                    # Geometric mean for bin center (appropriate for log scale)
+                    vals = efficiencies_valid[mask]
+                    bin_means.append(vals.mean())
+                    bin_stds.append(vals.std())
                     bin_centers.append(np.sqrt(log_bins[i] * log_bins[i+1]))
-                    bin_counts.append(mask.sum())
             
-            if len(bin_means) > 0:
-                ax.plot(bin_centers, bin_means, 'r-', linewidth=2, marker='o', markersize=6, label='Binned Average')
-                ax.legend(fontsize=12)
+            if bin_means:
+                if use_error_bars:
+                    ax.errorbar(bin_centers, bin_means, yerr=bin_stds, fmt='o-', color='r', linewidth=2, markersize=6, label='Mean ± std')
+                else:
+                    ax.plot(bin_centers, bin_means, 'o-', color='r', linewidth=2, markersize=6, label='Mean efficiency')
+                legend = ax.legend(fontsize=tick_size)
+                if legend:
+                    for text in legend.get_texts():
+                        text.set_fontsize(tick_size)
         plt.tight_layout()
         plt.savefig(plot_dir / 'efficiency_vs_pt.png', dpi=150)
         plt.close()
@@ -979,14 +1167,15 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         efficiencies_array = np.array(efficiencies_by_eta)
         
         ax.scatter(etas_array, efficiencies_array, alpha=0.5, s=20, label='Individual Tracks')
-        ax.set_xlabel('Track η', fontsize=12)
-        ax.set_ylabel('Tracking Efficiency', fontsize=12)
+        tick_size = _get_tick_label_size(ax)
+        ax.set_xlabel('Track η', fontsize=tick_size)
+        ax.set_ylabel('Tracking Efficiency', fontsize=tick_size)
         ax.grid(True, alpha=0.3)
         
         # Add average efficiency text box
         avg_eff_eta = np.mean(efficiencies_array) if len(efficiencies_array) > 0 else 0.0
-        ax.text(0.02, 0.98, f'Average Efficiency: {avg_eff_eta:.3f}', 
-                transform=ax.transAxes, fontsize=12,
+        ax.text(0.02, 0.98, f'Average Efficiency: {avg_eff_eta:.3f}',
+                transform=ax.transAxes, fontsize=tick_size,
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         # Bin by eta for better visualization
@@ -995,28 +1184,28 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
             eta_bins = np.linspace(min(etas_array), max(etas_array), n_bins + 1)
             bin_means = []
             bin_centers = []
-            bin_counts = []
+            bin_stds = []
             for i in range(len(eta_bins)-1):
                 mask = (etas_array >= eta_bins[i]) & (etas_array < eta_bins[i+1])
                 if mask.sum() > 0:
-                    bin_means.append(np.mean(efficiencies_array[mask]))
+                    vals = efficiencies_array[mask]
+                    bin_means.append(vals.mean())
+                    bin_stds.append(vals.std())
                     bin_centers.append((eta_bins[i] + eta_bins[i+1]) / 2)
-                    bin_counts.append(mask.sum())
-            if len(bin_means) > 0:
-                # Show data points on binned average (like pt plot)
-                ax.plot(bin_centers, bin_means, 'r-', linewidth=2, marker='o', markersize=6, label='Binned Average')
-                ax.legend(fontsize=12)
+            if bin_means:
+                if use_error_bars:
+                    ax.errorbar(bin_centers, bin_means, yerr=bin_stds, fmt='o-', color='r', linewidth=2, markersize=6, label='Mean ± std')
+                else:
+                    ax.plot(bin_centers, bin_means, 'o-', color='r', linewidth=2, markersize=6, label='Mean efficiency')
+                legend = ax.legend(fontsize=tick_size)
+                if legend:
+                    for text in legend.get_texts():
+                        text.set_fontsize(tick_size)
         plt.tight_layout()
         plt.savefig(plot_dir / 'efficiency_vs_eta.png', dpi=150)
         plt.close()
         print(f"Saved efficiency vs eta plot to {plot_dir / 'efficiency_vs_eta.png'}")
     
-    plt.rcParams.update({
-        "font.size": 14,
-        "axes.labelsize": 16,
-        "axes.titlesize": 16,
-    })
-
     # Plot 4: Efficiency vs track length (using expected hits post-seed)
     track_lengths = [r['expected_hits'] for r in track_results if r['expected_hits'] > 0]
     efficiencies_by_length = [r['efficiency'] for r in track_results if r['expected_hits'] > 0]
@@ -1024,22 +1213,30 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         fig, ax = plt.subplots(figsize=(10, 6))
         lengths_array = np.array(track_lengths)
         efficiencies_length_array = np.array(efficiencies_by_length)
-        ax.set_xlabel('Track Length (truth hits after seed)', fontsize=12)
-        ax.set_ylabel('Tracking Efficiency', fontsize=12)
+        tick_size = _get_tick_label_size(ax)
+        ax.set_xlabel('Track Length (truth hits after seed)', fontsize=tick_size)
+        ax.set_ylabel('Tracking Efficiency', fontsize=tick_size)
         ax.grid(True, alpha=0.3)
         
-        # Average efficiency per unique track length
         unique_lengths = np.unique(lengths_array)
         if len(unique_lengths) > 0:
-            averages = []
+            means = []
+            stds = []
             for length in unique_lengths:
                 mask = lengths_array == length
                 if np.any(mask):
-                    averages.append((length, np.mean(efficiencies_length_array[mask])))
-            if averages:
-                avg_lengths, avg_efficiencies = zip(*averages)
-                ax.plot(avg_lengths, avg_efficiencies, 'r-', linewidth=2, marker='o', markersize=6, label='Average by track length')
-                ax.legend(fontsize=12)
+                    vals = efficiencies_length_array[mask]
+                    means.append(vals.mean())
+                    stds.append(vals.std())
+            if means:
+                if use_error_bars:
+                    ax.errorbar(unique_lengths, means, yerr=stds, fmt='o-', color='r', linewidth=2, markersize=6, label='Mean ± std')
+                else:
+                    ax.plot(unique_lengths, means, 'o-', color='r', linewidth=2, markersize=6, label='Mean efficiency')
+                legend = ax.legend(fontsize=tick_size)
+                if legend:
+                    for text in legend.get_texts():
+                        text.set_fontsize(tick_size)
         plt.tight_layout()
         plt.savefig(plot_dir / 'efficiency_vs_track_length.png', dpi=150)
         plt.close()
@@ -1061,22 +1258,26 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         plt.close()
         print(f"Saved action histogram to {plot_dir / 'action_histogram.png'}")
 
-    if confusion_pairs:
-        fig, ax = plt.subplots(figsize=(10, 8))
-        confusion_matrix = np.zeros((num_actions, num_actions), dtype=int)
-        for pred, truth in confusion_pairs:
-            confusion_matrix[pred, truth] += 1
-        im = ax.imshow(confusion_matrix, cmap='viridis')
-        ax.set_xlabel('True action index', fontsize=12)
-        ax.set_ylabel('Predicted action index', fontsize=12)
-        ax.set_title('Action Confusion Matrix')
-        ax.set_xticks(np.arange(num_actions))
-        ax.set_yticks(np.arange(num_actions))
-        plt.colorbar(im, ax=ax)
-        plt.tight_layout()
-        plt.savefig(plot_dir / 'action_confusion_matrix.png', dpi=150)
-        plt.close()
-        print(f"Saved action confusion matrix to {plot_dir / 'action_confusion_matrix.png'}")
+        if confusion_pairs:
+            fig, ax = plt.subplots(figsize=(10, 8))
+            confusion_matrix = np.zeros((num_actions, num_actions), dtype=int)
+            for pred, truth in confusion_pairs:
+                confusion_matrix[pred, truth] += 1
+            min_nonzero = confusion_matrix[confusion_matrix > 0].min() if (confusion_matrix > 0).any() else 1
+            vmin = max(min_nonzero, 1e-6)
+            vmax = max(confusion_matrix.max(), vmin * 10)
+            norm = colors.LogNorm(vmin=vmin, vmax=vmax)
+            im = ax.imshow(confusion_matrix, cmap='viridis', norm=norm)
+            ax.set_xlabel('True action index', fontsize=12)
+            ax.set_ylabel('Predicted action index', fontsize=12)
+            ax.set_title('Action Confusion Matrix')
+            ax.set_xticks(np.arange(num_actions))
+            ax.set_yticks(np.arange(num_actions))
+            plt.colorbar(im, ax=ax)
+            plt.tight_layout()
+            plt.savefig(plot_dir / 'action_confusion_matrix.png', dpi=150)
+            plt.close()
+            print(f"Saved action confusion matrix to {plot_dir / 'action_confusion_matrix.png'}")
     
     # Save results to file
     results_file = plot_dir / "evaluation_results.txt"
@@ -1162,6 +1363,17 @@ if __name__ == "__main__":
         default=None,
         help='Directory to store evaluation artifacts (plots/results). Defaults to <checkpoint_dir>/evaluation/<checkpoint_name>'
     )
+    parser.add_argument(
+        '--use_error_bars',
+        action='store_true',
+        help='Render efficiency plots with mean ± std error bars instead of just mean curves.'
+    )
     args = parser.parse_args()
     
-    evaluate_model(args.checkpoint, args.config, args.test_data_dir, args.output_dir)
+    evaluate_model(
+        args.checkpoint,
+        args.config,
+        args.test_data_dir,
+        args.output_dir,
+        use_error_bars=args.use_error_bars,
+    )

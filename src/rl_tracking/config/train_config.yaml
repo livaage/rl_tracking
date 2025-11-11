@@ -20,6 +20,7 @@ environment:
   use_truth_path_plan: true
   hit_feature_mode: relative  # absolute or relative
   state_feature_mode: reduced  # full or reduced
+  state_feature_set: slope_intercept_v1
 model:
   batch_size: 128
   episode_length: 200

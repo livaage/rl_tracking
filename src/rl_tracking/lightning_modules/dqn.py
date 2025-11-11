@@ -38,6 +38,7 @@ class DQNLightning(LightningModule):
         use_truth_path_plan: bool = False,
         hit_feature_mode: str = "absolute",
         state_feature_mode: str = "full",
+        state_feature_set: str = "default",
     ) -> None:
         """Basic DQN Model.
 
@@ -85,6 +86,10 @@ class DQNLightning(LightningModule):
             state_feature_mode=state_feature_mode,
         )
         setattr(self.env, "context_tag", "train")
+        setattr(self.env, "state_feature_set", state_feature_set)
+        if hasattr(self.env, "state_feature_metadata"):
+            self.env.state_feature_metadata["set"] = state_feature_set
+        self.state_feature_set = state_feature_set
 
         # Use PointerNetwork instead of DQN for feature-based hit selection
         # State dim comes from enriched observation (track context features)
@@ -119,6 +124,9 @@ class DQNLightning(LightningModule):
             state_feature_mode=state_feature_mode,
         )
         setattr(self.val_env, "context_tag", "val")
+        setattr(self.val_env, "state_feature_set", state_feature_set)
+        if hasattr(self.val_env, "state_feature_metadata"):
+            self.val_env.state_feature_metadata["set"] = state_feature_set
         self.val_agent = Agent(self.val_env, self.val_buffer)
         
         self.agent = Agent(self.env, self.buffer)
@@ -538,6 +546,10 @@ class DQNLightning(LightningModule):
                     "unknown": 2.0,
                 }.get(reason, 2.0)
                 self.log("episode_termination_reason", reason_id)
+                failure_counts = stats.get("layer_failures", {})
+                for fail_key, fail_value in failure_counts.items():
+                    metric_name = f"episode_fail_{fail_key}"
+                    self.log(metric_name, float(fail_value))
             self.total_reward = self.episode_reward
             self.episode_reward = 0
 

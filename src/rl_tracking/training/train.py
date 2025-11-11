@@ -74,6 +74,7 @@ def main(config_path: str | Path):
     use_truth_path_plan = environment_config.get('use_truth_path_plan', False)
     hit_feature_mode = environment_config.get('hit_feature_mode', 'absolute')
     state_feature_mode = environment_config.get('state_feature_mode', 'full')
+    state_feature_set = environment_config.get('state_feature_set', 'unspecified')
     
     # Initialize model with configuration
     model = DQNLightning(
@@ -95,6 +96,7 @@ def main(config_path: str | Path):
         use_truth_path_plan=use_truth_path_plan,
         hit_feature_mode=hit_feature_mode,
         state_feature_mode=state_feature_mode,
+        state_feature_set=state_feature_set,
     )
     
     # Extract wandb configuration (needed for checkpoint directory name)
@@ -132,6 +134,7 @@ def main(config_path: str | Path):
     print(f"  Use truth path plan: {use_truth_path_plan}")
     print(f"  Hit feature mode: {hit_feature_mode}")
     print(f"  State feature mode: {state_feature_mode}")
+    print(f"  State feature set: {state_feature_set}")
     print(f"  Learning rate: {model_config.get('lr', 0.01)}")
     print(f"  Batch size: {model_config.get('batch_size', 32)}")
     print(f"{'='*60}\n")
