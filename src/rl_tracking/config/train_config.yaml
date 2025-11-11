@@ -3,19 +3,19 @@ data:
   batch_size: 128
   data_dir: /scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data/part_1
   event_processor:
-    n_neighbors: 20
+    n_neighbors: 10
   include_all_parts: true
-  num_workers: 0
+  num_workers: 3
   parts_glob: part_*
   random_seed: 42
   test_split: 0.1
-  val_split: 0.2
+  val_split: 0.05
 environment:
   hit_filters: {}
   particle_filters:
     nhits_max: 20
     nhits_min: 4
-    pt: 0.5
+    pt: 2
   use_distance_reward: false
   use_truth_path_plan: true
   hit_feature_mode: relative  # absolute or relative
@@ -27,8 +27,8 @@ model:
   eps_last_frame: 5000
   eps_start: 1.0
   gamma: 0.99
-  lr: 0.005
-  replay_size: 10000
+  lr: 0.05
+  replay_size: 100000
   sync_rate: 10
   warm_start_size: 1000
   warm_start_steps: 1000
@@ -43,7 +43,7 @@ trainer:
       save_last: true
       save_top_k: 1
     early_stopping:
-      check_val_every_n_epoch: 100
+      check_val_every_n_epoch: 1000
       min_delta: 0.001
       mode: max
       monitor: val_hit_accuracy
@@ -51,7 +51,7 @@ trainer:
   devices: 1
   gradient_clip_val: 10.0
   log_every_n_steps: 10
-  max_epochs: 5000
+  max_epochs: 20000
 wandb:
   log_model: true
   name: ptcut1_initial_run

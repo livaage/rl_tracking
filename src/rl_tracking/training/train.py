@@ -72,6 +72,8 @@ def main(config_path: str | Path):
     hit_filters = environment_config.get('hit_filters', {})
     use_distance_reward = environment_config.get('use_distance_reward', False)
     use_truth_path_plan = environment_config.get('use_truth_path_plan', False)
+    hit_feature_mode = environment_config.get('hit_feature_mode', 'absolute')
+    state_feature_mode = environment_config.get('state_feature_mode', 'full')
     
     # Initialize model with configuration
     model = DQNLightning(
@@ -91,6 +93,8 @@ def main(config_path: str | Path):
         hit_filters=hit_filters,
         use_distance_reward=use_distance_reward,
         use_truth_path_plan=use_truth_path_plan,
+        hit_feature_mode=hit_feature_mode,
+        state_feature_mode=state_feature_mode,
     )
     
     # Extract wandb configuration (needed for checkpoint directory name)
@@ -126,6 +130,8 @@ def main(config_path: str | Path):
     print(f"  Hit filters: {hit_filters}")
     print(f"  Use distance reward: {use_distance_reward}")
     print(f"  Use truth path plan: {use_truth_path_plan}")
+    print(f"  Hit feature mode: {hit_feature_mode}")
+    print(f"  State feature mode: {state_feature_mode}")
     print(f"  Learning rate: {model_config.get('lr', 0.01)}")
     print(f"  Batch size: {model_config.get('batch_size', 32)}")
     print(f"{'='*60}\n")

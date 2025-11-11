@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List, Set
 
 import numpy as np
 import pandas as pd
@@ -128,6 +128,11 @@ class StraightLineTrackingEnv:
         self.rank_selection_counts = Counter()
         self.rank_correct_counts = Counter()
         self.last_selected_hit: Optional[pd.Series] = None
+        self.last_selected_action_index: Optional[int] = None
+        self.last_selected_hit_id: Optional[int] = None
+        self.episode_seed_layer_max: Optional[float] = None
+        self.episode_layers_post_seed: List[float] = []
+        self.episode_layers_with_correct_hit: Set[float] = set()
         self.last_episode_stats: Optional[Dict[str, float]] = None
         self.truth_hit_total: int = 0
 
@@ -145,7 +150,28 @@ class StraightLineTrackingEnv:
 
     @staticmethod
     def _layer_info_path() -> Path:
-        return Path(__file__).resolve().parent.parent / "physics" / "layer_info.csv"
+        base_dir = Path(__file__).resolve().parent.parent
+        primary = base_dir / "physics" / "layer_info.csv"
+        if primary.exists():
+            return primary
+
+        fallback_candidates = [
+            base_dir / "training" / "layer_info.csv",
+            base_dir / "layer_info.csv",
+        ]
+        for candidate in fallback_candidates:
+            if candidate.exists():
+                logger.warning(
+                    "Using fallback layer_info.csv from %s because the primary physics asset is missing.",
+                    candidate,
+                )
+                return candidate
+
+        searched = [str(primary)] + [str(path) for path in fallback_candidates]
+        raise FileNotFoundError(
+            "Could not locate 'layer_info.csv' required for detector geometry. "
+            f"Searched: {', '.join(searched)}. Ensure the geometry assets are installed with the package."
+        )
 
     def _load_layer_geometry(self) -> Dict[int, LayerSurface]:
         path = self._layer_info_path()
@@ -331,6 +357,18 @@ class StraightLineTrackingEnv:
             self.rank_correct_counts.clear()
             self.last_selected_hit = None
             self.last_episode_stats = None
+            seed_layer_ids = set(self.accepted_hits["unique_layer_id"].astype(int))
+            self.episode_seed_layer_max = (
+                float(max(seed_layer_ids)) if seed_layer_ids else None
+            )
+            all_layers = sorted(self.current_track["unique_layer_id"].unique())
+            if self.episode_seed_layer_max is not None:
+                self.episode_layers_post_seed = [
+                    float(layer) for layer in all_layers if layer > self.episode_seed_layer_max
+                ]
+            else:
+                self.episode_layers_post_seed = [float(layer) for layer in all_layers]
+            self.episode_layers_with_correct_hit = set()
 
             state, info = self.get_current_state()
             if state is not None:
@@ -524,12 +562,16 @@ class StraightLineTrackingEnv:
 
         features: list[float] = []
 
-        features.extend([
-            z / coord_scale,
-            r / coord_scale,
-            x / coord_scale,
-            y / coord_scale,
-        ])
+        if self.state_feature_mode == "full":
+            features.extend([
+                z / coord_scale,
+                r / coord_scale,
+                x / coord_scale,
+                y / coord_scale,
+            ])
+        else:
+            # Reduced mode drops absolute coordinates
+            features.extend([0.0, 0.0, 0.0, 0.0])
 
         if len(self.accepted_hits) >= 2:
             prev = self.accepted_hits.iloc[-2]
@@ -537,26 +579,28 @@ class StraightLineTrackingEnv:
             prev_x = float(prev["x"])
             prev_y = float(prev["y"])
             prev_r = float(prev.get("r", np.hypot(prev_x, prev_y)))
-            features.extend([
+            delta_values = [
                 (z - prev_z) / delta_scale,
                 (r - prev_r) / delta_scale,
                 (x - prev_x) / delta_scale,
                 (y - prev_y) / delta_scale,
-            ])
+            ]
         else:
-            features.extend([0.0, 0.0, 0.0, 0.0])
+            delta_values = [0.0, 0.0, 0.0, 0.0]
+        features.extend(delta_values)
 
         if self.current_predicted_point is not None:
             pred_x, pred_y, pred_z = self.current_predicted_point.tolist()
             pred_r = np.hypot(pred_x, pred_y)
-            features.extend([
+            pred_values = [
                 (pred_z - z) / delta_scale,
                 (pred_r - r) / delta_scale,
                 (pred_x - x) / delta_scale,
                 (pred_y - y) / delta_scale,
-            ])
+            ]
         else:
-            features.extend([0.0, 0.0, 0.0, 0.0])
+            pred_values = [0.0, 0.0, 0.0, 0.0]
+        features.extend(pred_values)
 
         unique_layer = float(self.current_target_unique_layer or 0)
         volume_id = float(self.current_target_volume or 0)
@@ -564,11 +608,16 @@ class StraightLineTrackingEnv:
         if self.truth_hit_total > 0:
             remaining_ratio = self.current_remaining_hits / float(self.truth_hit_total)
 
-        features.extend([
+        summary_values = [
             unique_layer / layer_scale,
             volume_id / volume_scale,
             remaining_ratio,
-        ])
+        ]
+        features.extend(summary_values)
+
+        if self.state_feature_mode == "reduced":
+            # Remove the absolute coordinate block (first four values)
+            features = features[4:]
 
         obs = np.array(features, dtype=np.float32)
         return np.clip(obs, -10.0, 10.0)
@@ -646,12 +695,26 @@ class StraightLineTrackingEnv:
             self.distance_history.extend(candidates["distance"].tolist())
 
         hit_features = np.zeros((self.MAX_CANDIDATES, 4), dtype=np.float32)
+        pred_x, pred_y, pred_z = predicted_point.tolist()
+        pred_r = np.hypot(pred_x, pred_y)
         for idx in range(len(candidates)):
             row = candidates.iloc[idx]
-            hit_features[idx] = np.array(
-                [row["x"], row["y"], row["z"], row["r"]],
-                dtype=np.float32,
-            )
+            if self.hit_feature_mode == "relative":
+                values = np.array(
+                    [
+                        row["x"] - pred_x,
+                        row["y"] - pred_y,
+                        row["z"] - pred_z,
+                        row["r"] - pred_r,
+                    ],
+                    dtype=np.float32,
+                )
+            else:
+                values = np.array(
+                    [row["x"], row["y"], row["z"], row["r"]],
+                    dtype=np.float32,
+                )
+            hit_features[idx] = values
 
         info = {
             "hit_features": hit_features,
@@ -673,15 +736,18 @@ class StraightLineTrackingEnv:
 
         if not self.current_candidates.empty:
             clamped_action = int(np.clip(action, 0, len(self.current_candidates) - 1))
+            self.last_selected_action_index = clamped_action
             selected = self.current_candidates.iloc[clamped_action]
             selected_hit_id = int(selected["hit_id"])
             reward = float(self.current_rewards[clamped_action])
+            self.last_selected_hit_id = selected_hit_id
             is_correct = selected_hit_id in self.current_truth_hit_ids
         else:
             selected = None
             selected_hit_id = None
             reward = 0.0
             is_correct = False
+            self.last_selected_hit_id = None
 
         if selected is not None:
             self.accepted_hits = pd.concat(
@@ -700,14 +766,22 @@ class StraightLineTrackingEnv:
                 self.rank_correct_counts[clamped_action] += 1
 
         self.last_selected_hit = selected
+        if (
+            is_correct
+            and self.episode_seed_layer_max is not None
+            and selected is not None
+            and "unique_layer_id" in selected
+        ):
+            selected_layer = float(selected["unique_layer_id"])
+            if selected_layer > self.episode_seed_layer_max:
+                self.episode_layers_with_correct_hit.add(selected_layer)
+
+        next_state, info = self.get_current_state()
+        done = False
         self.current_target_index += 1
         self.hit_number = self.current_target_index
 
-        done = False
-        if (
-            self.current_target_index >= len(self.truth_hits)
-            or self.current_candidates.empty
-        ):
+        if self.current_target_index >= len(self.truth_hits) or self.current_candidates.empty:
             done = True
 
         if done:
@@ -720,4 +794,33 @@ class StraightLineTrackingEnv:
             episode_stats = {
                 "reason": reason,
                 "total_selections": self.total_selections,
-                "correct_selections": self.correct_selec
+                "correct_selections": self.correct_selections,
+                "expected_hits": float(expected_hits),
+                "layer_total": float(len(self.episode_layers_post_seed)),
+                "layer_correct": float(len(self.episode_layers_with_correct_hit)),
+            }
+            context = getattr(self, "context_tag", "unknown")
+            logger.info(
+                "[%s] Episode done: reason=%s, selections=%d, correct=%d, expected=%d",
+                context,
+                reason,
+                self.total_selections,
+                self.correct_selections,
+                expected_hits,
+            )
+            next_state, info = self.reset()
+            self.last_episode_stats = episode_stats
+        else:
+            next_state, info = self.get_current_state()
+
+        self.current_info = info
+        truncated = False
+        return next_state, reward, done, truncated, info
+
+
+class TrackingEnv(StraightLineTrackingEnv):
+    """Backward-compatible alias that supports legacy keyword arguments."""
+
+    def __init__(self, data_loader, *args, use_truth_path_plan: bool = False, **kwargs):
+        self.use_truth_path_plan = use_truth_path_plan
+        super().__init__(data_loader, *args, **kwargs)

@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import os
 import torch
+import shutil
 from rl_tracking.utils.logger import get_logger
 
 logger = get_logger()
@@ -32,12 +33,25 @@ def _resolve_geometry_path(filename: str) -> Path:
     Raises:
         FileNotFoundError: If the file cannot be found.
     """
+    package_root = Path(__file__).resolve().parent.parent
     candidates = [
         GEOMETRY_DIR / filename,
-        Path(__file__).resolve().parent.parent / filename,
+        package_root / filename,
+        package_root / "training" / filename,
     ]
     for candidate in candidates:
         if candidate.exists():
+            # If file found outside primary geometry dir, optionally copy it
+            if candidate.parent != GEOMETRY_DIR:
+                target = GEOMETRY_DIR / filename
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if candidate != target:
+                        shutil.copy2(candidate, target)
+                    return target
+                except OSError:
+                    # Fall back to using the original path if copying fails
+                    return candidate
             return candidate
     searched = ", ".join(str(path) for path in candidates)
     raise FileNotFoundError(f"Could not locate '{filename}'. Locations checked: {searched}")

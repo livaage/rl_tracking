@@ -122,9 +122,9 @@ class Agent:
         scores_masked[~hit_mask_tensor] = (
             -100.0
         )  # Match the range used in pointer network
-        action = int(torch.argmax(scores_masked).item())
+        action_index = int(torch.argmax(scores_masked).item())
 
-        return action
+        return action_index
 
     @torch.no_grad()
     def play_step(
@@ -149,10 +149,10 @@ class Agent:
 
         if state is not None:
             arr = np.asarray(state, dtype=np.float32)
-            if arr.size not in (0, 15):
-                print(f"[Agent] Current state size: {arr.size}, shape: {arr.shape}")
-        else:
-            print("[Agent] Current state is None")
+            #if arr.size not in (0, 15):
+           #     print(f"[Agent] Current state size: {arr.size}, shape: {arr.shape}")
+        #else:
+        #    print("[Agent] Current state is None")
 
         # Extract hit features and mask from current state info
         hit_features = state_info.get(
@@ -164,8 +164,8 @@ class Agent:
         next_state, reward, done, _, step_info = self.env.step(action)
         if next_state is not None:
             next_arr = np.asarray(next_state, dtype=np.float32)
-            if next_arr.size not in (0, 15):
-                print(f"[Agent] Next state size: {next_arr.size}, shape: {next_arr.shape}, type: {type(next_state)}")
+            #if next_arr.size not in (0, 15):
+            #    print(f"[Agent] Next state size: {next_arr.size}, shape: {next_arr.shape}, type: {type(next_state)}")
         else:
             print("[Agent] Next state is None")
         next_info = step_info or {}

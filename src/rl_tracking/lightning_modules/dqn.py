@@ -36,6 +36,8 @@ class DQNLightning(LightningModule):
         hit_filters: dict = None,
         use_distance_reward: bool = False,
         use_truth_path_plan: bool = False,
+        hit_feature_mode: str = "absolute",
+        state_feature_mode: str = "full",
     ) -> None:
         """Basic DQN Model.
 
@@ -73,9 +75,6 @@ class DQNLightning(LightningModule):
             pin_memory=False,
             drop_last=False
         )
-        hit_feature_mode = environment_config.get('hit_feature_mode', 'absolute')
-        state_feature_mode = environment_config.get('state_feature_mode', 'full')
-        
         self.env = TrackingEnv(
             env_dataloader, 
             particle_filters=particle_filters, 
@@ -587,7 +586,7 @@ class DQNLightning(LightningModule):
         termination_reasons: List[str] = []
         accuracies: List[float] = []
 
-        num_episodes = 10
+        num_episodes = 20
 
         with torch.no_grad():
             for _ in range(num_episodes):
@@ -605,13 +604,14 @@ class DQNLightning(LightningModule):
                 if not stats:
                     continue
 
-                expected = float(stats.get("expected_hits", 0.0))
+                layer_total = float(stats.get("layer_total", 0.0))
+                layer_correct = float(stats.get("layer_correct", 0.0))
                 predicted = float(stats.get("total_selections", 0.0))
                 correct = float(stats.get("correct_selections", 0.0))
                 reason = stats.get("reason", "unknown")
 
-                if expected > 0:
-                    efficiencies.append(correct / max(expected, 1e-9))
+                if layer_total > 0:
+                    efficiencies.append(layer_correct / max(layer_total, 1e-9))
                 if predicted > 0:
                     purities.append(correct / max(predicted, 1e-9))
                 if predicted > 0:

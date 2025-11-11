@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import mplhep as hep
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from rl_tracking.lightning_modules.dqn import DQNLightning
 from rl_tracking.preprocessing.hit_candidates import EventProcessor
@@ -16,12 +17,11 @@ from rl_tracking.utils.data_paths import resolve_data_directories
 from rl_tracking.environment.tracking_env import TrackingEnv
 from rl_tracking.environment.agent import Agent
 from rl_tracking.replay.buffer import ReplayBuffer
-from rl_tracking.physics.hit_holder import HitHolder
 import pandas as pd
 
 DEFAULT_TRACKML_DIR = Path("/scratch/gpfs/IOJALVO/gnn-tracking/object_condensation/codalab-data/part_1")
 
-def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str = None):
+def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str = None, output_dir: str = None):
     """Evaluate a trained model on the test set track-by-track.
     
     Args:
@@ -29,10 +29,28 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         config_path: Optional path to the training configuration YAML file.
                      If None, will try to load from checkpoint directory.
         test_data_dir: Optional path to test data directory (if different from config)
+        output_dir: Optional directory to store evaluation artifacts (plots, logs).
+                    Defaults to <checkpoint_dir>/evaluation/<checkpoint_name>
     """
+    checkpoint_path = Path(model_path).expanduser()
+    if checkpoint_path.is_dir():
+        potential_ckpts = sorted(checkpoint_path.glob("*.ckpt"))
+        if len(potential_ckpts) == 1:
+            checkpoint_path = potential_ckpts[0]
+        else:
+            raise ValueError(
+                f"Checkpoint path '{checkpoint_path}' is a directory. "
+                "Please provide the full path to a .ckpt file."
+            )
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    checkpoint_path = checkpoint_path.resolve()
+    model_path = str(checkpoint_path)
+    checkpoint_dir = checkpoint_path.parent
+    checkpoint_stem = checkpoint_path.stem
+
     # If config_path not provided, try to find it in checkpoint directory
     if config_path is None:
-        checkpoint_dir = Path(model_path).parent
         # Look for config file in checkpoint directory
         config_files = list(checkpoint_dir.glob('*.yaml')) + list(checkpoint_dir.glob('*.yml'))
         if config_files:
@@ -98,6 +116,8 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     hit_filters = environment_config.get('hit_filters', {})
     use_distance_reward = environment_config.get('use_distance_reward', False)
     use_truth_path_plan = environment_config.get('use_truth_path_plan', False)
+    hit_feature_mode = environment_config.get('hit_feature_mode', 'absolute')
+    state_feature_mode = environment_config.get('state_feature_mode', 'full')
     
     # Ensure particle_filters and hit_filters are dictionaries (not None)
     # Empty dict {} means "no filtering", None means "use defaults"
@@ -167,6 +187,8 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
             hit_filters = checkpoint_hparams.get('hit_filters', hit_filters)
             use_distance_reward = checkpoint_hparams.get('use_distance_reward', use_distance_reward)
             use_truth_path_plan = checkpoint_hparams.get('use_truth_path_plan', use_truth_path_plan)
+            hit_feature_mode = checkpoint_hparams.get('hit_feature_mode', hit_feature_mode)
+            state_feature_mode = checkpoint_hparams.get('state_feature_mode', state_feature_mode)
         else:
             print(f"⚠️  No hyperparameters found in checkpoint. Using config file values.")
             print(f"   This may cause mismatches if config differs from training config!\n")
@@ -205,6 +227,8 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     print(f"Hit filters (used for test): {hit_filters}")
     print(f"Use distance reward: {use_distance_reward}")
     print(f"Use truth path plan: {use_truth_path_plan}")
+    print(f"Hit feature mode: {hit_feature_mode}")
+    print(f"State feature mode: {state_feature_mode}")
     print(f"{'='*60}\n")
     
     # Verify that pt filter is set correctly
@@ -248,7 +272,9 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         hit_filters=hit_filters,
         use_distance_reward=use_distance_reward,
         use_truth_path_plan=use_truth_path_plan,
-        deterministic=True  # CRITICAL: Use deterministic ordering for evaluation reproducibility
+        deterministic=True,  # CRITICAL: Use deterministic ordering for evaluation reproducibility
+        hit_feature_mode=hit_feature_mode,
+        state_feature_mode=state_feature_mode,
     )
     if hasattr(test_env, "rank_selection_counts"):
         test_env.rank_selection_counts.clear()
@@ -300,11 +326,27 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     
     epsilon = 0.0  # Pure exploitation - no exploration
     max_tracks = 1000  # Limit evaluation to reasonable number
+    num_actions = getattr(getattr(test_env, "action_space", None), "n", 0)
+    action_counts = np.zeros(num_actions, dtype=int) if num_actions else None
+    invalid_action_count = 0
     
+    max_attempts = max_tracks * 5  # Allow retries for skipped/invalid tracks
+    progress_bar = tqdm(total=max_tracks, desc="Evaluating tracks", unit="track")
+
+    confusion_pairs = []
+
     try:
         tracks_skipped = 0
         consecutive_none = 0
+        attempt_count = 0
         while total_tracks < max_tracks:
+            attempt_count += 1
+            if attempt_count > max_attempts:
+                print(
+                    f"\nReached maximum attempts ({max_attempts}) with only {total_tracks} tracks evaluated."
+                    " Stopping early to avoid infinite loops on invalid tracks."
+                )
+                break
             # Reset environment (starts new track)
             obs, info = test_env.reset()
             if obs is None:
@@ -323,19 +365,22 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
             
             # Reset consecutive_none counter if we got a valid observation
             consecutive_none = 0
+            test_agent.state = obs
+            test_agent.info = info or {}
             
             # Check if track has valid data
             if not hasattr(test_env, 'current_track') or test_env.current_track is None or len(test_env.current_track) == 0:
                 tracks_skipped += 1
+                progress_bar.set_postfix(skipped=tracks_skipped)
                 if tracks_skipped <= 5:
                     print(f"WARNING: Track {total_tracks + 1} has no data, skipping...")
                 continue
             
-            if not hasattr(test_env, 'helix') or test_env.helix is None:
-                tracks_skipped += 1
-                if tracks_skipped <= 5:
-                    print(f"WARNING: Track {total_tracks + 1} has no helix, skipping...")
-                continue
+            # Debug candidate info for first few tracks
+            if total_tracks < 3:
+                mask_initial = info.get("hit_mask") if isinstance(info, dict) else None
+                mask_count = int(mask_initial.sum()) if mask_initial is not None else -1
+                print(f"DEBUG Track {total_tracks}: initial candidate count = {mask_count}")
             
             # Track reconstruction metrics for this track
             track_start_time = time.time()
@@ -352,6 +397,13 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
             correct_hit_ids = set()
             seed_hit_ids = set()
             termination_reason = 'unknown'  # Will be updated when track completes
+            helix_available = hasattr(test_env, 'helix') and test_env.helix is not None
+            seed_layer_ids = set()
+            initial_start_layer = None
+            path_plan_layers = []
+            path_plan_hits_after_seed = set()
+            correct_hit_ids_in_path = set()
+            truth_path_layers = []
             
             # Verify this track should be included based on filters
             # (This is a sanity check - filters should have been applied already)
@@ -368,215 +420,139 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
             track_pt = None
             track_eta = None
             if hasattr(test_env, 'current_track') and test_env.current_track is not None:
-                # Get all correct hit IDs for this track
-                correct_hit_ids = set(test_env.current_track['hit_id'].values)
-                
-                # CRITICAL: Use the TRUE pt from the particle's pt column, not the estimated helix.pt
-                # The helix.pt is estimated from seed hits and can differ from the true pt
-                # The filter uses the true pt column, so we should use the same for plotting
-                if 'pt' in test_env.current_track.columns and len(test_env.current_track) > 0:
-                    # All hits in a track should have the same pt (they're from the same particle)
-                    track_pt = float(test_env.current_track['pt'].iloc[0])
-                
-                # Get seed hits (first 3 hits from first 3 layers) - these should be excluded
-                if hasattr(test_env, 'helix') and test_env.helix is not None:
-                    if hasattr(test_env.helix, 'seed_hits') and test_env.helix.seed_hits is not None:
-                        # Get seed hit IDs - seed_hits is a DataFrame
-                        seed_df = test_env.helix.seed_hits
-                        if isinstance(seed_df, pd.DataFrame):
-                            if 'hit_id' in seed_df.columns:
-                                seed_hit_ids = set(seed_df['hit_id'].values.astype(int))
-                            else:
-                                # Try index if hit_id not in columns
-                                seed_hit_ids = set(seed_df.index.astype(int))
-                        else:
-                            # If it's not a DataFrame, try to get hit_id attribute
-                            seed_hit_ids = set()
-                    
-                    # Fallback: If track_pt wasn't set from current_track, use helix.pt (estimated)
-                    # But this should only happen if pt column is missing
+                track_df = test_env.current_track
+                if track_df.empty:
+                    continue
+
+                correct_hit_ids = set(track_df['hit_id'].astype(int).values)
+
+                if 'pt' in track_df.columns:
+                    track_pt = float(track_df['pt'].iloc[0])
+
+                if 'theta' in track_df.columns:
+                    theta_val = track_df['theta'].iloc[0]
+                    if theta_val is not None and 0 < theta_val < np.pi:
+                        track_eta = -np.log(np.tan(theta_val / 2.0))
+
+                # Determine seed hits/layers using environment seed length
+                seed_len = getattr(test_env, 'SEED_LENGTH', 3)
+                track_sorted = track_df.sort_values('unique_layer_id')
+                seed_subset = track_sorted.head(seed_len)
+                seed_hit_ids = set(seed_subset['hit_id'].astype(int).values)
+                seed_layer_ids = set(seed_subset['unique_layer_id'].astype(int).values)
+
+                # Fallback to helix-provided seeds if available
+                if helix_available:
+                    seed_df = getattr(test_env.helix, 'seed_hits', None)
+                    if isinstance(seed_df, pd.DataFrame) and not seed_df.empty:
+                        if 'hit_id' in seed_df.columns:
+                            seed_hit_ids = set(seed_df['hit_id'].astype(int).values)
+                        if 'unique_layer_id' in seed_df.columns:
+                            seed_layer_ids = set(seed_df['unique_layer_id'].astype(int).values)
+                    elif seed_df is not None:
+                        try:
+                            seed_hit_ids = set(int(hit) for hit in seed_df)
+                        except TypeError:
+                            pass
                     if track_pt is None and hasattr(test_env.helix, 'pt'):
                         track_pt = float(test_env.helix.pt)
-                        if total_tracks < 5:
-                            print(f"  WARNING: Using estimated helix.pt={track_pt:.3f} instead of true pt column")
-                    
-                    if hasattr(test_env.helix, 'theta'):
-                        # Convert theta to eta: eta = -ln(tan(theta/2))
-                        theta = test_env.helix.theta
-                        if theta > 0 and theta < np.pi:
-                            track_eta = -np.log(np.tan(theta / 2.0))
-                else:
-                    # Fallback: assume first 3 hits in track are seed hits
-                    # This is less accurate but works if helix.seed_hits is not accessible
-                    if len(test_env.current_track) >= 3:
-                        # Sort by layer to get first 3 layers
-                        track_sorted = test_env.current_track.sort_values('unique_layer_id')
-                        seed_hit_ids = set(track_sorted.head(3)['hit_id'].values.astype(int))
-                
-                # Expected hits: ALL hits after the seed (not just those in path_plan)
-                # Start: After the last seed layer (all seed hits are in first 3 layers)
-                # End: Include the last hit in the track
-                # Use initial_start_layer (the final seed layer) to determine what "after seed" means
-                if hasattr(test_env, 'helix') and test_env.helix is not None:
-                    # Get initial starting layer (final seed layer) - this doesn't change as we progress
-                    initial_start_layer = getattr(test_env.helix, 'initial_start_layer', None)
-                    if initial_start_layer is None:
-                        # Fallback: try to get from seed_hits (last seed layer)
-                        if hasattr(test_env.helix, 'seed_hits') and test_env.helix.seed_hits is not None:
-                            seed_df = test_env.helix.seed_hits
-                            if isinstance(seed_df, pd.DataFrame) and 'unique_layer_id' in seed_df.columns:
-                                seed_layers = seed_df['unique_layer_id'].values
-                                initial_start_layer = float(max(seed_layers)) if len(seed_layers) > 0 else None
-                    
-                    # Get ALL truth hits after the seed (not just those in path_plan)
-                    # Filter current_track to only include hits from layers AFTER the seed
-                    if initial_start_layer is not None:
-                        initial_start_layer_float = float(initial_start_layer)
-                        # Get all hits from layers after the seed layer
-                        track_hits_after_seed = test_env.current_track[
-                            test_env.current_track['unique_layer_id'] > initial_start_layer_float
+                    theta_val = getattr(test_env.helix, 'theta', None)
+                    if theta_val is not None and 0 < theta_val < np.pi:
+                        track_eta = -np.log(np.tan(theta_val / 2.0))
+
+                # Identify post-seed truth hits
+                post_seed_df = track_df[~track_df['hit_id'].isin(seed_hit_ids)].copy()
+                correct_hit_ids_in_path = set(post_seed_df['hit_id'].astype(int).values)
+
+                # Expected layers correspond to post-seed truth layers
+                truth_path_layers = [float(layer) for layer in sorted(post_seed_df['unique_layer_id'].unique())]
+                track_expected_hits = len(truth_path_layers)
+
+                # Keep reference layer for comparisons (max seed layer)
+                initial_start_layer = float(max(seed_layer_ids)) if seed_layer_ids else None
+
+                # If helix/path_plan available, capture but don't require
+                if helix_available:
+                    path_plan_source = getattr(test_env.helix, 'path_plan', None)
+                    if path_plan_source is not None:
+                        try:
+                            iterable_layers = list(path_plan_source)
+                        except TypeError:
+                            iterable_layers = [path_plan_source]
+                        path_plan_layers = [
+                            float(layer)
+                            for layer in iterable_layers
+                            if initial_start_layer is None or float(layer) > float(initial_start_layer)
                         ]
-                        all_truth_hits_after_seed = set(track_hits_after_seed['hit_id'].values)
-                        
-                        # Also get hits only from path_plan layers (for comparison/debugging)
-                        # This shows how many truth hits are also in the path_plan (but don't use for efficiency)
-                        if hasattr(test_env.helix, 'path_plan') and test_env.helix.path_plan is not None:
-                            all_path_layers = [float(layer) for layer in test_env.helix.path_plan]
-                            path_plan_layers = [layer for layer in all_path_layers if float(layer) > initial_start_layer_float]
-                            path_plan_layers_set = set(path_plan_layers)
-                            track_hits_in_path_plan = test_env.current_track[
-                                (test_env.current_track['unique_layer_id'] > initial_start_layer_float) &
-                                (test_env.current_track['unique_layer_id'].isin(path_plan_layers_set))
-                            ]
-                            path_plan_hits_after_seed = set(track_hits_in_path_plan['hit_id'].values)
-                        else:
-                            path_plan_hits_after_seed = all_truth_hits_after_seed
-                        
-                        # Expected hits: ALWAYS use ALL truth hits in the particle track (after seed)
-                        # This ensures efficiency reflects how many of the actual truth hits were found,
-                        # regardless of whether the model was trained with truth path plan or lookup path plan
-                        correct_hit_ids_in_path = all_truth_hits_after_seed
-                        expected_hits_source = "all truth hits in particle track (after seed)"
-                        
-                        # Debug logging for first few tracks
-                        if total_tracks < 3:
-                            print(f"DEBUG Track {total_tracks}: initial_start_layer={initial_start_layer}, "
-                                  f"total_hits_in_track={len(test_env.current_track)}, "
-                                  f"all_truth_hits_after_seed={len(all_truth_hits_after_seed)}, "
-                                  f"path_plan_hits_after_seed={len(path_plan_hits_after_seed)}, "
-                                  f"using: {expected_hits_source}, "
-                                  f"seed_hit_ids={len(seed_hit_ids)}")
-                    else:
-                        # Fallback: exclude seed hits by ID
-                        correct_hit_ids_in_path = correct_hit_ids - seed_hit_ids
-                else:
-                    # Fallback: use all hits if helix not available, just exclude seed hits
-                    correct_hit_ids_in_path = correct_hit_ids - seed_hit_ids
-                
-                # Expected layers: Count unique layers with truth hits (after seed)
-                # Efficiency = layers where we found at least one correct hit / total layers with truth hits
-                # This allows one hit per layer - if there are double hits and we only find one, that's OK
-                if initial_start_layer is not None:
-                    truth_hits_after_seed_df = test_env.current_track[
-                        test_env.current_track['unique_layer_id'] > initial_start_layer
-                    ]
-                else:
-                    truth_hits_after_seed_df = test_env.current_track[
-                        ~test_env.current_track['hit_id'].isin(seed_hit_ids)
-                    ]
-                
-                # Count unique layers with truth hits
-                track_expected_hits = len(truth_hits_after_seed_df['unique_layer_id'].unique())
-                if track_expected_hits < 0:
-                    track_expected_hits = 0
-                
-                # Get truth-level path (all layers in current_track, excluding seed)
-                truth_path_layers = []
-                if hasattr(test_env, 'current_track') and test_env.current_track is not None and len(test_env.current_track) > 0:
-                    # Get all unique layers from current_track, sorted
-                    all_track_layers = sorted(test_env.current_track['unique_layer_id'].unique())
-                    # Filter to post-seed layers
-                    if initial_start_layer is not None:
-                        # Only include layers that come after the seed layer
-                        truth_path_layers = [float(layer) for layer in all_track_layers if float(layer) > initial_start_layer]
-                    else:
-                        # Fallback: exclude seed layers by ID
-                        if len(seed_layer_ids) > 0:
-                            truth_path_layers = [float(layer) for layer in all_track_layers if layer not in seed_layer_ids]
-                        else:
-                            # If we can't identify seed layers, assume first 3 layers are seed
-                            if len(all_track_layers) > 3:
-                                truth_path_layers = [float(layer) for layer in all_track_layers[3:]]
+                path_plan_hits_after_seed = correct_hit_ids_in_path if not path_plan_layers else set()
+                if path_plan_layers:
+                    path_plan_layer_set = set(path_plan_layers)
+                    path_plan_hits_after_seed = set(
+                        post_seed_df[post_seed_df['unique_layer_id'].isin(path_plan_layer_set)]['hit_id'].astype(int).values
+                    )
+
+                expected_hits_source = "all truth hits after seed"
+                if total_tracks < 3:
+                    print(
+                        f"DEBUG Track {total_tracks}: initial_start_layer={initial_start_layer}, "
+                        f"total_hits_in_track={len(track_df)}, "
+                        f"post_seed_hits={len(post_seed_df)}, "
+                        f"path_plan_hits_after_seed={len(path_plan_hits_after_seed)}, "
+                        f"using: {expected_hits_source}, "
+                        f"seed_hit_ids={len(seed_hit_ids)}"
+                    )
                 
                 # Debug: if truth_path_layers is empty, it might mean the track only has seed hits
                 # This can happen if nhits_min is 3 and all hits are in seed layers
             
             # Track the actual path taken vs expected path
-            expected_path_layers = []
+            expected_path_layers = list(path_plan_layers) if path_plan_layers else list(truth_path_layers)
             actual_path_layers = []  # Layers where we actually selected hits
             skipped_layers = []  # Layers we visited but found no hits
             # truth_path_layers already computed above (before the loop)
             termination_reason = 'unknown'  # Why the track ended
-            seed_layer_ids = set()
-            if hasattr(test_env, 'helix') and test_env.helix is not None:
-                # Get seed layer IDs from seed_hits
-                if hasattr(test_env.helix, 'seed_hits') and test_env.helix.seed_hits is not None:
-                    seed_df = test_env.helix.seed_hits
-                    if isinstance(seed_df, pd.DataFrame) and 'unique_layer_id' in seed_df.columns:
-                        seed_layer_ids = set(seed_df['unique_layer_id'].values.astype(int))
-                    elif isinstance(seed_df, pd.DataFrame) and 'unique_layer_id' in seed_df.index:
-                        seed_layer_ids = set(seed_df.index.values.astype(int))
-                
-                # Get the starting layer (final seed layer) - use initial_start_layer which doesn't change
-                initial_start_layer = getattr(test_env.helix, 'initial_start_layer', None)
-                if initial_start_layer is None:
-                    # Fallback: get from current_layer at start (before it advances)
-                    initial_start_layer = getattr(test_env.helix, 'current_layer', None)
-                
-                if hasattr(test_env.helix, 'path_plan') and test_env.helix.path_plan is not None:
-                    # Filter path_plan to only include layers AFTER the seed (after initial_start_layer)
-                    # initial_start_layer is the final seed layer, so we only want layers > initial_start_layer
-                    all_path_layers = list(test_env.helix.path_plan)
-                    if initial_start_layer is not None:
-                        # Only include layers that come after the starting layer (post-seed)
-                        expected_path_layers = [layer for layer in all_path_layers if layer > initial_start_layer]
-                    else:
-                        # Fallback: exclude seed layers by ID
-                        expected_path_layers = [layer for layer in all_path_layers if layer not in seed_layer_ids]
-                else:
-                    initial_start_layer = None
             
             # Reconstruct track step by step
             done = False
             while not done:
-                # Get action (inference timing)
-                inference_start = time.time()
-                action = test_agent.get_action(model.net, epsilon, device)
-                inference_end = time.time()
-                
-                # Step environment
-                env_start = time.time()
-                step_result = test_env.step(action)
-                env_end = time.time()
-                
-                # Track propagation state before step
+                info_before = test_agent.info or {}
+                candidate_ids = info_before.get("candidate_hit_ids", [])
+                candidate_mask = info_before.get("hit_mask", np.zeros(num_actions, dtype=bool))
+                correct_indices = [
+                    idx
+                    for idx, hit_id in enumerate(candidate_ids)
+                    if idx < len(candidate_mask) and candidate_mask[idx] and hit_id in correct_hit_ids
+                ]
+                true_action_index = correct_indices[0] if correct_indices else None
+
                 prev_hit_number = getattr(test_env, 'hit_number', 0)
-                had_comp_hits = hasattr(test_env, 'current_comp_hits') and test_env.current_comp_hits is not None and len(test_env.current_comp_hits) > 0
-                
-                # Handle return format
-                if len(step_result) == 3:
-                    next_obs, reward, done = step_result
-                else:
-                    next_obs, reward, terminated, truncated, _ = step_result
-                    done = terminated or truncated
-                
+                reward, done = test_agent.play_step(model.net, epsilon=epsilon, device=device)
+
+                # Update action counts (Agent stores last action in replay buffer entry)
+                if hasattr(test_env, 'last_selected_hit_id') and action_counts is not None:
+                    last_action = getattr(test_env, 'last_selected_action_index', None)
+                    if last_action is not None and 0 <= last_action < len(action_counts):
+                        action_counts[last_action] += 1
+                    elif last_action is not None:
+                        invalid_action_count += 1
+                predicted_action_index = getattr(test_env, 'last_selected_action_index', None)
+                if (
+                    predicted_action_index is not None
+                    and true_action_index is not None
+                    and 0 <= predicted_action_index < num_actions
+                    and 0 <= true_action_index < num_actions
+                ):
+                    confusion_pairs.append((predicted_action_index, true_action_index))
+
                 # Track why episode ended - distinguish between path complete vs no hits found
                 if done:
                     # Check if path_plan is exhausted (end of expected path)
                     path_exhausted = False
-                    if hasattr(test_env, 'helix') and test_env.helix is not None:
+                    if helix_available and hasattr(test_env.helix, 'path_plan') and test_env.helix.path_plan is not None:
                         unexplored_layers = test_env.helix.path_plan[test_env.helix.path_plan > test_env.helix.current_layer]
                         path_exhausted = len(unexplored_layers) == 0
+                    elif expected_path_layers:
+                        path_exhausted = len(actual_path_layers) >= len(expected_path_layers)
                     
                     # Check if we ran out of hits vs propagation failed
                     current_hit_number = getattr(test_env, 'hit_number', 0)
@@ -586,7 +562,7 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                         termination_reason = 'path_complete'  # Reached end of path_plan
                     elif current_hit_number >= track_length:
                         termination_reason = 'completed_all_hits'  # All truth hits visited
-                    elif next_obs is None:
+                    elif test_agent.state is None:
                         termination_reason = 'no_compatible_hits'  # No hits found in compatible layers
                     else:
                         termination_reason = 'unknown'
@@ -602,18 +578,29 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                 if hasattr(test_env, 'last_selected_hit_id') and test_env.last_selected_hit_id is not None:
                     selected_hit_id = test_env.last_selected_hit_id
                     
-                    # Get the layer of the selected hit (not current_layer, which may have advanced)
-                    selected_hit_layer = None
-                    if hasattr(test_env, 'last_selected_hit') and test_env.last_selected_hit is not None:
+                    # Determine layer of selected hit using pre-step target layer
+                    selected_hit_layer = target_layer_before_step
+                    if selected_hit_layer is None and hasattr(test_env, 'last_selected_hit') and test_env.last_selected_hit is not None:
                         selected_hit = test_env.last_selected_hit
                         if isinstance(selected_hit, pd.Series) and 'unique_layer_id' in selected_hit.index:
                             selected_hit_layer = float(selected_hit['unique_layer_id'])
                         elif hasattr(selected_hit, 'unique_layer_id'):
                             selected_hit_layer = float(selected_hit.unique_layer_id)
-                    
-                    # Fallback: use current_layer if we can't get it from the hit
-                    if selected_hit_layer is None and hasattr(test_env, 'helix') and test_env.helix is not None:
-                        selected_hit_layer = getattr(test_env.helix, 'current_layer', None)
+                    if selected_hit_layer is None and hasattr(test_env, 'current_target_unique_layer'):
+                        selected_hit_layer = float(test_env.current_target_unique_layer)
+                    if total_tracks < 3:
+                        info_debug = test_agent.info or {}
+                        raw_scores = info_debug.get("raw_scores")
+                        masked_scores = info_debug.get("masked_scores")
+                        chosen_action = info_debug.get("chosen_action")
+                        print(f"    DEBUG Track {total_tracks} Step {track_steps}: selected_hit_id={selected_hit_id}, "
+                              f"layer={selected_hit_layer}, is_seed={selected_hit_id in seed_hit_ids}, "
+                              f"is_correct={selected_hit_id in correct_hit_ids_in_path}, "
+                              f"chosen_action={chosen_action}")
+                        if raw_scores is not None:
+                            print(f"    DEBUG Track {total_tracks} Step {track_steps}: raw_scores={raw_scores}")
+                        if masked_scores is not None:
+                            print(f"    DEBUG Track {total_tracks} Step {track_steps}: masked_scores={masked_scores}")
                     
                     # Track which layer we selected a hit from (only post-seed layers)
                     if selected_hit_layer is not None and initial_start_layer is not None:
@@ -629,68 +616,36 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                             selected_hit_ids.append(selected_hit_id)
                             track_predicted_hits += 1
                             
-                            # Check if selected hit is correct (using environment's tracking)
-                            # The environment's last_selected_hit_correct already checks if the hit is in the correct hits for that layer
-                            # We just need to verify it's not a seed hit (which we already excluded from track_predicted_hits)
-                            # Note: We count ALL correct hits after the seed, not just those in path_plan
-                            # If the environment says it's correct and it's not a seed hit, count it
-                            if test_env.last_selected_hit_correct:
+                            # Determine correctness using truth hit IDs
+                            if selected_hit_id in correct_hit_ids_in_path:
                                 track_correct_hits += 1
                                 # Track that we found at least one correct hit in this layer
                                 if selected_hit_layer is not None and initial_start_layer is not None:
                                     if selected_hit_layer > initial_start_layer:
                                         layers_with_correct_hit.add(selected_hit_layer)
                             
-                            # Calculate distance to correct hit for debugging
-                            # Use the correct hits from the layer where the hit was actually selected
-                            # (stored in environment before it advanced to next layer)
-                            distance_to_correct = None
-                            if hasattr(test_env, 'last_selected_hit_correct_hits_df') and test_env.last_selected_hit_correct_hits_df is not None:
-                                correct_hits_df = test_env.last_selected_hit_correct_hits_df
-                                if len(correct_hits_df) > 0:
-                                    hit_holder = HitHolder(test_env.all_hits)
-                                    distance_to_correct = hit_holder.get_distance_to_correct(selected_hit, correct_hits_df)
-                            elif hasattr(test_env, 'helix') and test_env.helix is not None:
-                                # Fallback: try to get correct hits for the selected hit's layer
-                                if selected_hit_layer is not None:
-                                    correct_hits_df = test_env.helix.get_correct_hits_df_in_layer(selected_hit_layer)
-                                    if correct_hits_df is not None and len(correct_hits_df) > 0:
-                                        hit_holder = HitHolder(test_env.all_hits)
-                                        distance_to_correct = hit_holder.get_distance_to_correct(selected_hit, correct_hits_df)
-                            
-                            # Log distance for debugging (for first few tracks or incorrect selections)
-                            if total_tracks < 5 or not test_env.last_selected_hit_correct:
+                            if total_tracks < 5:
                                 layer_info = f"layer={selected_hit_layer}" if selected_hit_layer is not None else "layer=unknown"
-                                correct_info = "CORRECT" if test_env.last_selected_hit_correct else "WRONG"
-                                distance_info = f"distance={distance_to_correct:.3f}cm" if distance_to_correct is not None and distance_to_correct != np.inf else "distance=inf"
-                                
-                                # Show how many correct hits are in this layer (for debugging)
-                                num_correct_in_layer = 0
-                                if hasattr(test_env, 'last_selected_hit_correct_hits_df') and test_env.last_selected_hit_correct_hits_df is not None:
-                                    num_correct_in_layer = len(test_env.last_selected_hit_correct_hits_df)
-                                elif hasattr(test_env, 'helix') and test_env.helix is not None and selected_hit_layer is not None:
-                                    correct_hits_df = test_env.helix.get_correct_hits_df_in_layer(selected_hit_layer)
-                                    if correct_hits_df is not None:
-                                        num_correct_in_layer = len(correct_hits_df)
-                                
-                                correct_hits_info = f"({num_correct_in_layer} correct hits in layer)" if num_correct_in_layer > 0 else "(no correct hits in layer)"
-                                print(f"  Track {total_tracks}, Step {track_steps}: Selected hit_id={selected_hit_id} in {layer_info}, {correct_info}, {distance_info} {correct_hits_info}")
+                                correct_info = "CORRECT" if selected_hit_id in correct_hit_ids_in_path else "WRONG"
+                                print(f"  Track {total_tracks}, Step {track_steps}: Selected hit_id={selected_hit_id} in {layer_info}, {correct_info}")
                 else:
                     # No hit selected - track which layer we skipped (only post-seed layers)
                     # Only count as skipped if we're in a layer that's in the expected path
                     # and we haven't already selected a hit from this layer
-                    if hasattr(test_env, 'helix') and test_env.helix is not None:
-                        current_layer = getattr(test_env.helix, 'current_layer', None)
-                        if current_layer is not None and initial_start_layer is not None:
-                            # Only count if it's a post-seed layer in the expected path
-                            # and we haven't already selected a hit from this layer
-                            if current_layer > initial_start_layer and current_layer in expected_path_layers:
-                                # Only mark as skipped if we haven't already selected a hit from this layer
-                                if current_layer not in actual_path_layers:
-                                    if current_layer not in skipped_layers:
-                                        skipped_layers.append(current_layer)
+                    current_layer = target_layer_before_step
+                    if current_layer is None:
+                        if helix_available and hasattr(test_env, 'helix') and test_env.helix is not None:
+                            current_layer = getattr(test_env.helix, 'current_layer', None)
+                        else:
+                            current_layer = getattr(test_env, 'current_target_unique_layer', None)
+                    if current_layer is not None:
+                        current_layer = float(current_layer)
+                    if current_layer is not None and initial_start_layer is not None and expected_path_layers:
+                        if current_layer > initial_start_layer and current_layer in expected_path_layers:
+                            if current_layer not in actual_path_layers and current_layer not in skipped_layers:
+                                skipped_layers.append(current_layer)
                 
-                obs = next_obs
+                # Loop continues with agent state/info already updated inside play_step
                 
                 if done:
                     break
@@ -781,7 +736,7 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                 'eta': track_eta if track_eta is not None else 0.0,
                 'final_hit_number': final_hit_number,
                 'track_length': track_length,
-                'completion_ratio': final_hit_number / track_length if track_length > 0 else 0.0,
+                'completion_ratio': len(actual_path_layers) / track_expected_hits if track_expected_hits > 0 else 0.0,
                 'termination_reason': term_reason,
                 'expected_path_layers': expected_path_layers,
                 'actual_path_layers': actual_path_layers,
@@ -789,12 +744,15 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                 'expected_path_length': len(expected_path_layers),
                 'actual_path_length': len(actual_path_layers),
                 'skipped_count': len(skipped_layers),
+                'layer_correct_count': len(layers_with_correct_hit),
+                'layer_total_count': track_expected_hits,
             })
             
             total_tracks += 1
             total_correct_hits += track_correct_hits
             total_predicted_hits += track_predicted_hits
             total_expected_hits += track_expected_hits
+            progress_bar.update(1)
             
             # Print progress
             if total_tracks % 10 == 0:
@@ -805,6 +763,8 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     
     except StopIteration:
         print("Reached end of test dataset")
+    finally:
+        progress_bar.close()
     
     # Calculate final metrics
     if total_tracks == 0:
@@ -829,8 +789,8 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     avg_final_hit_number = np.mean([r['final_hit_number'] for r in track_results]) if track_results else 0.0
     
     # Path analysis statistics
-    avg_expected_path_length = np.mean([r.get('expected_path_length', 0) for r in track_results if 'expected_path_length' in r]) if track_results else 0.0
-    avg_actual_path_length = np.mean([r.get('actual_path_length', 0) for r in track_results if 'actual_path_length' in r]) if track_results else 0.0
+    avg_expected_path_length = np.mean([r.get('expected_path_length', 0) for r in track_results]) if track_results else 0.0
+    avg_actual_path_length = np.mean([r.get('actual_path_length', 0) for r in track_results]) if track_results else 0.0
     avg_skipped_count = np.mean([r.get('skipped_count', 0) for r in track_results if 'skipped_count' in r]) if track_results else 0.0
     
     # Count termination reasons
@@ -838,6 +798,10 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     for r in track_results:
         reason = r.get('termination_reason', 'unknown')
         termination_reasons[reason] = termination_reasons.get(reason, 0) + 1
+
+    total_layer_correct = sum(r.get('layer_correct_count', 0) for r in track_results)
+    total_layer_total = sum(r.get('layer_total_count', 0) for r in track_results)
+    overall_path_coverage = total_layer_correct / total_layer_total if total_layer_total > 0 else 0.0
 
     rank_metrics = {}
     if hasattr(test_env, "get_rank_selection_metrics"):
@@ -870,7 +834,7 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     print(f"  Average Expected Path Length: {avg_expected_path_length:.2f} layers")
     print(f"  Average Actual Path Length (with hits): {avg_actual_path_length:.2f} layers")
     print(f"  Average Skipped Layers: {avg_skipped_count:.2f} layers")
-    print(f"  Path Coverage: {avg_actual_path_length/avg_expected_path_length*100:.1f}%" if avg_expected_path_length > 0 else "  Path Coverage: N/A")
+    print(f"  Path Coverage: {overall_path_coverage*100:.1f}%" if total_layer_total > 0 else "  Path Coverage: N/A")
     print(f"\nTermination Reasons:")
     for reason, count in termination_reasons.items():
         print(f"  {reason}: {count} ({count/total_tracks*100:.1f}%)")
@@ -889,11 +853,27 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
     print(f"  Average Track Time: {avg_track_time*1000:.2f} ms")
     print(f"  Total Evaluation Time: {total_time:.2f} seconds")
     print(f"  Tracks per Second: {total_tracks/total_time:.2f}" if total_time > 0 else "  Tracks per Second: N/A")
+    if action_counts is not None:
+        total_actions = action_counts.sum()
+        print(f"\nAction Usage (total selections: {total_actions}):")
+        if total_actions > 0:
+            for action_idx, count in enumerate(action_counts):
+                if count > 0:
+                    pct = count / total_actions * 100.0
+                    print(f"  Action {action_idx:02d}: {count} selections ({pct:.2f}%)")
+        if invalid_action_count:
+            print(f"  Invalid actions encountered: {invalid_action_count}")
     print(f"{'='*60}\n")
     
     # Create plots
-    plot_dir = Path(model_path).parent
-    plot_dir.mkdir(exist_ok=True)
+    if output_dir is not None:
+        plot_dir = Path(output_dir).expanduser()
+        plot_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        evaluation_root = checkpoint_dir / "evaluation"
+        plot_dir = evaluation_root / checkpoint_stem
+        plot_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Saving evaluation artifacts to: {plot_dir}")
     
     # Set CMS style for all plots
     hep.style.use("CMS")
@@ -1031,8 +1011,75 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
         plt.close()
         print(f"Saved efficiency vs eta plot to {plot_dir / 'efficiency_vs_eta.png'}")
     
+    plt.rcParams.update({
+        "font.size": 14,
+        "axes.labelsize": 16,
+        "axes.titlesize": 16,
+    })
+
+    # Plot 4: Efficiency vs track length (using expected hits post-seed)
+    track_lengths = [r['expected_hits'] for r in track_results if r['expected_hits'] > 0]
+    efficiencies_by_length = [r['efficiency'] for r in track_results if r['expected_hits'] > 0]
+    if len(track_lengths) > 0:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        lengths_array = np.array(track_lengths)
+        efficiencies_length_array = np.array(efficiencies_by_length)
+        ax.set_xlabel('Track Length (truth hits after seed)', fontsize=12)
+        ax.set_ylabel('Tracking Efficiency', fontsize=12)
+        ax.grid(True, alpha=0.3)
+        
+        # Average efficiency per unique track length
+        unique_lengths = np.unique(lengths_array)
+        if len(unique_lengths) > 0:
+            averages = []
+            for length in unique_lengths:
+                mask = lengths_array == length
+                if np.any(mask):
+                    averages.append((length, np.mean(efficiencies_length_array[mask])))
+            if averages:
+                avg_lengths, avg_efficiencies = zip(*averages)
+                ax.plot(avg_lengths, avg_efficiencies, 'r-', linewidth=2, marker='o', markersize=6, label='Average by track length')
+                ax.legend(fontsize=12)
+        plt.tight_layout()
+        plt.savefig(plot_dir / 'efficiency_vs_track_length.png', dpi=150)
+        plt.close()
+        print(f"Saved efficiency vs track length plot to {plot_dir / 'efficiency_vs_track_length.png'}")
+ 
+    # Plot 5: Action selection histogram
+    if action_counts is not None and action_counts.sum() > 0:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        actions = np.arange(len(action_counts))
+        ax.bar(actions, action_counts, color='tab:blue', alpha=0.85)
+        ax.set_xlabel('Action index', fontsize=12)
+        ax.set_ylabel('Selections', fontsize=12)
+        ax.set_title('Action Selection Frequency')
+        ax.set_xticks(actions)
+        ax.set_yscale('log')
+        ax.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(plot_dir / 'action_histogram.png', dpi=150)
+        plt.close()
+        print(f"Saved action histogram to {plot_dir / 'action_histogram.png'}")
+
+    if confusion_pairs:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        confusion_matrix = np.zeros((num_actions, num_actions), dtype=int)
+        for pred, truth in confusion_pairs:
+            confusion_matrix[pred, truth] += 1
+        im = ax.imshow(confusion_matrix, cmap='viridis')
+        ax.set_xlabel('True action index', fontsize=12)
+        ax.set_ylabel('Predicted action index', fontsize=12)
+        ax.set_title('Action Confusion Matrix')
+        ax.set_xticks(np.arange(num_actions))
+        ax.set_yticks(np.arange(num_actions))
+        plt.colorbar(im, ax=ax)
+        plt.tight_layout()
+        plt.savefig(plot_dir / 'action_confusion_matrix.png', dpi=150)
+        plt.close()
+        print(f"Saved action confusion matrix to {plot_dir / 'action_confusion_matrix.png'}")
+    
     # Save results to file
-    results_file = Path(model_path).parent / "evaluation_results.txt"
+    results_file = plot_dir / "evaluation_results.txt"
     with open(results_file, 'w') as f:
         f.write("TRACK-BY-TRACK EVALUATION RESULTS (Test Set Only)\n")
         f.write("="*60 + "\n")
@@ -1066,6 +1113,17 @@ def evaluate_model(model_path: str, config_path: str = None, test_data_dir: str 
                     f.write(
                         f"  Rank {rank}: accuracy={accuracy:.4f} ({int(correct)}/{int(total)})\n"
                     )
+        if action_counts is not None:
+            total_actions = action_counts.sum()
+            f.write("\nAction Usage:\n")
+            f.write(f"  Total actions observed: {total_actions}\n")
+            if total_actions > 0:
+                for action_idx, count in enumerate(action_counts):
+                    if count > 0:
+                        pct = count / total_actions * 100.0
+                        f.write(f"  Action {action_idx:02d}: {count} selections ({pct:.2f}%)\n")
+            if invalid_action_count:
+                f.write(f"  Invalid actions encountered: {invalid_action_count}\n")
     
     print(f"Results saved to {results_file}")
     print(f"Plots saved to {plot_dir}")
@@ -1098,6 +1156,12 @@ if __name__ == "__main__":
         default=None,
         help='Optional path to test data directory (overrides config; can point to a specific part directory)'
     )
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default=None,
+        help='Directory to store evaluation artifacts (plots/results). Defaults to <checkpoint_dir>/evaluation/<checkpoint_name>'
+    )
     args = parser.parse_args()
     
-    evaluate_model(args.checkpoint, args.config, args.test_data_dir)
+    evaluate_model(args.checkpoint, args.config, args.test_data_dir, args.output_dir)
